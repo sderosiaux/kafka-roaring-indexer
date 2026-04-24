@@ -4,7 +4,7 @@ An experiment: what does the smallest useful pre-aggregated analytics index over
 
 No broker fork. No schema changes. No fleet of OLAP services. One YAML, one process, one HTTP endpoint.
 
-![KRI Explorer — bitmap-indexed stream analytics](docs/screenshot.png)
+![KRI Explorer: bitmap-indexed stream analytics](docs/screenshot.png)
 
 ## The problem
 
@@ -12,9 +12,9 @@ Kafka is a log. Analytics questions are not log questions.
 
 > *How many distinct users in FR, on mobile, hit a 5xx in the last hour?*
 
-To answer that with only Kafka, you scan. Every time. Or you push everything into a full OLAP engine — Druid, Pinot, ClickHouse, Snowflake — which solves the problem but drags along a distributed cluster, an ingestion pipeline, a schema catalog, a query planner, a cost center. For a handful of dashboards and alerts, that's three orders of magnitude too much machinery.
+To answer that with only Kafka, you scan. Every time. Or you push everything into a full OLAP engine (Druid, Pinot, ClickHouse, Snowflake), which solves the problem but drags along a distributed cluster, an ingestion pipeline, a schema catalog, a query planner, a cost center. For a handful of dashboards and alerts, that's three orders of magnitude too much machinery.
 
-The interesting gap sits in the middle. Pick the right two data structures — bitmaps for set membership, sketches for cardinality — organise them by time bucket, and you can answer the *actual questions product teams ask* in milliseconds on billions of records, from a single-process sidecar that a team can reason about end to end.
+Pick the right two data structures (bitmaps for set membership, sketches for cardinality), organise them by time bucket, and you can answer the *actual questions product teams ask* in milliseconds on billions of records, from a single-process sidecar that a team can reason about end to end.
 
 ## The bet
 
@@ -23,7 +23,7 @@ Two data structures do most of the work:
 - **Roaring bitmaps** — one bitmap per `(dimension, value)` pair per time bucket, storing the set of members (usually user ids) that matched. Exact. AND / OR / NOT become one-to-three-nanosecond-per-word SIMD set operations. Compressed. Widely-used (Druid, Pinot, Lucene internals).
 - **UltraLogLog** — an ~800-byte probabilistic sketch with ~0.8% error for distinct-count on high-cardinality fields where you cannot afford to store a bitmap per value. Mergeable across time buckets. Idempotent under replay.
 
-One member type per indexer (the entity whose membership is tracked — typically `userId`). A dimension is a declared path into the record with a chosen encoding (`dict` / `raw_uint32` / `hash32` / `hash64`). Segments are time-bucketed, immutable once rolled, fsynced to disk before their Kafka offsets commit.
+One member type per indexer (the entity whose membership is tracked, typically `userId`). A dimension is a declared path into the record with a chosen encoding (`dict` / `raw_uint32` / `hash32` / `hash64`). Segments are time-bucketed, immutable once rolled, fsynced to disk before their Kafka offsets commit.
 
 That's the whole model. Everything else is plumbing around it.
 
@@ -56,7 +56,7 @@ graph TD
 
 ## The use case
 
-Think of a product analytics stream on a Kafka topic: one record per user event, maybe 10k–100k msg/s, a dozen dimensions (country, device, path, status, experiment bucket, …), retained for 30 days.
+A typical use case: a product analytics stream on Kafka, one record per user event, 10k–100k msg/s, a dozen dimensions (country, device, path, status, experiment bucket, …), retained for 30 days.
 
 Things this indexer answers cheaply:
 
@@ -74,7 +74,7 @@ Things it deliberately does **not** do:
 - Distributed queries. One process, one topic, one member type.
 - Exact count-distinct on fields without an explicit dict (use a sketch or pick your encoding).
 
-The design note lives in [`SPEC.md`](SPEC.md). The DSL is a single YAML validated against [`schema/indexer.schema.json`](schema/indexer.schema.json) — a full example in [`examples/events-analytics.yaml`](examples/events-analytics.yaml).
+The design note lives in [`SPEC.md`](SPEC.md). Full example config: [`examples/events-analytics.yaml`](examples/events-analytics.yaml). Schema: [`schema/indexer.schema.json`](schema/indexer.schema.json).
 
 ## What's interesting in the design
 
@@ -107,7 +107,7 @@ Deliberately skipped in v1, flagged in the task list: ART backing for the dict (
 
 ## Storage layout: partitions, segments, manifest
 
-One Kafka topic produces one directory tree on disk. The consumer consumes every partition, and the indexer carves the data into **one segment per `(partition, time bucket)`** — the natural unit at which Kafka offsets are linear and at which a query plan wants to fan out.
+One Kafka topic produces one directory tree on disk. The consumer consumes every partition, and the indexer carves the data into **one segment per `(partition, time bucket)`**: the natural unit at which Kafka offsets are linear and at which a query plan wants to fan out.
 
 ```mermaid
 flowchart LR
@@ -165,7 +165,7 @@ Rollover is the moment that matters: `seg.freeze()` runs `runOptimize` on every 
                       FastAggregation.or(bm_0 … bm_19) → unified result
 ```
 
-Each cell is **independent**: its own dict, its own bitmaps, its own offset range on one Kafka partition. A query over a time range fetches every cell intersecting that range across every partition and unions the per-segment bitmaps. Cross-partition distinct-count is correct as long as the member id is stable across partitions — which is the case for `raw_uint32` and `hash64`, and which is why `dict` member encoding is called out as a cross-segment limitation in the evaluator.
+Each cell is **independent**: its own dict, its own bitmaps, its own offset range on one Kafka partition. A query over a time range fetches every cell intersecting that range across every partition and unions the per-segment bitmaps. Cross-partition distinct-count is correct as long as the member id is stable across partitions. This holds for `raw_uint32` and `hash64`; it's why `dict` member encoding is called out as a cross-segment limitation in the evaluator.
 
 ### A segment on disk
 
@@ -194,7 +194,7 @@ segments/seg_00000000000000000003_p00000_1777024800000_1777028400000/
     └── totalLatencyMs.sum  [8-byte long]
 ```
 
-The `.rbi` wire format is portable Roaring, readable from any language with a Roaring port — the file is a list of `(valueId, bitmap)` pairs length-prefixed, nothing bespoke.
+The `.rbi` wire format is portable Roaring, readable from any language with a Roaring port. The file is a list of `(valueId, bitmap)` pairs, length-prefixed, nothing bespoke.
 
 ### The manifest
 
@@ -220,7 +220,7 @@ A single `manifest.json` at the root is the source of truth for *which segments 
 }
 ```
 
-Why it exists: a query with `from=10h&to=15h` must not scan `segments/`. It filters `manifest.entries` on `(startMs < to) AND (endMs > from)` — plus an optional `partitions` subset — to get the list of directories to touch. Directory scan is O(list) and, on object storage, a paid operation per segment. Manifest lookup is O(1) once cached.
+Why it exists: a query with `from=10h&to=15h` must not scan `segments/`. It filters `manifest.entries` on `(startMs < to) AND (endMs > from)`, with an optional `partitions` subset, to get the list of directories to touch. Directory scan is O(list) and, on object storage, a paid operation per segment. Manifest lookup is O(1) once cached.
 
 Startup path: `loadAll` reads the manifest if present and loads only the entries it lists; if the manifest is missing (legacy directory or corrupted write), it falls back to a directory scan and rebuilds the manifest as a side effect. So the manifest is advisory for correctness and authoritative for planning.
 
@@ -240,7 +240,7 @@ GET /query
 { "segments": 24, "matched": 48211, "result": 48211, "metric": "cardinality", "approx": false }
 ```
 
-Under the hood: find the segments overlapping `[from, to)`, **fan out** filter evaluation across them (parallel on `ForkJoinPool` once `segments.size ≥ parallelThreshold`), each segment reduces the filter AST into a `RoaringBitmap` from its pre-built dim-value bitmaps, then **gather** via `FastAggregation.or` — the cache-aware multi-way union beats a sequential fold. For cardinality the result is `.cardinality()` of the merged bitmap; for ULL metrics we either merge pre-computed sketches (approximate, requires exact-slice-match) or rebuild exactly from the matched bitmap when `metric.field == member.field`.
+Under the hood: find the segments overlapping `[from, to)`, **fan out** filter evaluation across them (parallel on `ForkJoinPool` once `segments.size ≥ parallelThreshold`), each segment reduces the filter AST into a `RoaringBitmap` from its pre-built dim-value bitmaps, then **gather** via `FastAggregation.or`; the cache-aware multi-way union beats a sequential fold. For cardinality the result is `.cardinality()` of the merged bitmap; for ULL metrics we either merge pre-computed sketches (approximate, requires exact-slice-match) or rebuild exactly from the matched bitmap when `metric.field == member.field`.
 
 ```mermaid
 flowchart TD
@@ -261,13 +261,13 @@ flowchart TD
   M --> O
 ```
 
-Concurrency with the writer: the consumer thread keeps ingesting into the open segment while queries run. Frozen segments are bitmap-immutable (no lock needed). The open segment is queried under a shared read-lock that clones each touched bitmap inside the lock window — the writer continues to mutate the live bitmaps under a per-bitmap `synchronized` guard, and the query operates on snapshots. Reads and writes don't serialize against each other; only `freeze()` (rollover) takes the write-lock and waits for in-flight reads to finish.
+Concurrency with the writer: the consumer thread keeps ingesting into the open segment while queries run. Frozen segments are bitmap-immutable (no lock needed). The open segment is queried under a shared read-lock that clones each touched bitmap inside the lock window; the writer continues to mutate the live bitmaps under a per-bitmap `synchronized` guard, and the query operates on snapshots. Reads and writes don't serialize against each other; only `freeze()` (rollover) takes the write-lock and waits for in-flight reads to finish.
 
 ## Prior art, positioning
 
-Druid, Pinot, ClickHouse, FeatureBase (ex-Pilosa) all use Roaring under the hood for posting lists — they're what you reach for when this sidecar is no longer enough. Tantivy / Lucene / Quickwit do the same inside search engines. Kafka Streams / ksqlDB occupy a different axis: streaming SQL transformations, not pre-aggregated indexes.
+Druid, Pinot, ClickHouse, FeatureBase (ex-Pilosa) all use Roaring under the hood for posting lists. They're what you reach for when this sidecar is no longer enough. Tantivy / Lucene / Quickwit do the same inside search engines. Kafka Streams / ksqlDB occupy a different axis: streaming SQL transformations, not pre-aggregated indexes.
 
-Closest cousin in spirit: **FeatureBase (Pilosa)**. Same mental model — "bitmap database" indexing declared dimensions for set-theoretic analytics, not full-text.
+Closest cousin in spirit: **FeatureBase (Pilosa)**. Same mental model: "bitmap database" indexing declared dimensions for set-theoretic analytics, not full-text.
 
 Often confused with us but genuinely different: **Quickwit**. Quickwit is a distributed search engine on Tantivy (Rust-Lucene) with Kafka sources; it scans posting lists and answers "find events matching". We are pre-aggregated per `(dim, value)` with the **member** as a first-class citizen, so we answer "how many **distinct users** match this filter" as one-to-three SIMD operations instead of a scan. Quickwit wins on log search, ad-hoc fields, and object-storage scale. We win on sub-millisecond distinct-cardinality on a declared, opinionated schema, from a single process.
 
