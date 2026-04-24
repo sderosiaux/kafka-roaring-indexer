@@ -117,7 +117,7 @@
     /* -------------------------------------------------------------------------- */
     const API = "";  // same origin
 
-    async function apiQuery({ filter, agg, from, to, partitions }) {
+    async function apiQuery({ filter, agg, from, to, partitions }, signal) {
       const p = new URLSearchParams();
       if (from) p.set("from", from);
       if (to) p.set("to", to);
@@ -125,7 +125,7 @@
       p.set("agg", agg.apiAgg || agg.id);
       if (partitions && partitions.length > 0) p.set("partitions", partitions.join(","));
       const t0 = Date.now();
-      const r = await fetch(API + "/query?" + p.toString());
+      const r = await fetch(API + "/query?" + p.toString(), { signal });
       const elapsed = Date.now() - t0;
       const data = await r.json();
       if (data.error) throw new Error(data.error);
@@ -143,14 +143,14 @@
       };
     }
 
-    async function apiFacets({ filter, top, from, to, partitions }) {
+    async function apiFacets({ filter, top, from, to, partitions }, signal) {
       const p = new URLSearchParams();
       if (from) p.set("from", from);
       if (to) p.set("to", to);
       if (filter && filter.trim()) p.set("filter", filter.trim());
       if (top) p.set("topN", String(top));
       if (partitions && partitions.length > 0) p.set("partitions", partitions.join(","));
-      const r = await fetch(API + "/facets?" + p.toString());
+      const r = await fetch(API + "/facets?" + p.toString(), { signal });
       const data = await r.json();
       if (data.error) throw new Error(data.error);
       const result = {};
@@ -165,8 +165,8 @@
       return result;
     }
 
-    async function apiSegments({ from, to, partitions }) {
-      const r = await fetch(API + "/segments");
+    async function apiSegments({ from, to, partitions }, signal) {
+      const r = await fetch(API + "/segments", { signal });
       const data = await r.json();
       if (!Array.isArray(data)) return [];
       const fromMs = from ? +new Date(from) : 0;
@@ -876,15 +876,18 @@
       const [val, setVal] = useState(target);
       const raf = useRef(null);
       const prev = useRef(target);
+      const displayed = useRef(target);
       useEffect(() => {
         if (prev.current === target) return;
-        const from = prev.current; const to = target;
+        const from = displayed.current; const to = target;
         prev.current = target;
         const t0 = performance.now();
         const tick = (now) => {
           const p = Math.min((now - t0) / dur, 1);
           const e = 1 - Math.pow(1 - p, 3);
-          setVal(Math.round(from + (to - from) * e));
+          const v = Math.round(from + (to - from) * e);
+          displayed.current = v;
+          setVal(v);
           if (p < 1) raf.current = requestAnimationFrame(tick);
         };
         if (raf.current) cancelAnimationFrame(raf.current);
@@ -926,6 +929,8 @@
       const [loadingSegments, setLoadingSegments] = useState(false);
       const [refreshing, setRefreshing] = useState(false);
       const hasResult = useRef(false);
+      const requestIdRef = useRef(0);
+      const abortRef = useRef(null);
       const [history, setHistory] = useState([]);
       const [historyOpen, setHistoryOpen] = useState(false);
       const [compareWith, setCompareWith] = useState(null);
@@ -934,6 +939,11 @@
       const aggObj = AGGS.find(a => a.id === qstate.agg) || AGGS[0];
 
       const runQuery = useCallback(async () => {
+        if (abortRef.current) abortRef.current.abort();
+        const abort = new AbortController();
+        abortRef.current = abort;
+        const reqId = ++requestIdRef.current;
+
         const isRefresh = hasResult.current;
         if (!isRefresh) {
           setLoadingQuery(true); setLoadingFacets(true); setLoadingSegments(true);
@@ -960,10 +970,12 @@
         };
 
         const [qRes, fRes, sRes] = await Promise.allSettled([
-          apiQuery(params),
-          apiFacets(params),
-          apiSegments(params),
+          apiQuery(params, abort.signal),
+          apiFacets(params, abort.signal),
+          apiSegments(params, abort.signal),
         ]);
+
+        if (reqId !== requestIdRef.current) return;
 
         if (qRes.status === "fulfilled") {
           hasResult.current = true;
@@ -1047,30 +1059,32 @@
 
       const addFilter = (dim, value) => {
         setQstate(s => {
-          const existing = s.filter.trim();
-          // Remove any clause for this dim (positive or NOT), then append new one
-          const dimRe = new RegExp(
-            `(?:(?:AND|OR)\\s+)?(?:NOT\\s+)?\\b${dim}:[A-Za-z0-9_,./:-]+(?=\\s+(?:AND|OR)|$)`,
-            'gi'
-          );
-          const cleaned = existing
-            .replace(dimRe, '')
-            .replace(/^\s*(AND|OR)\s+/i, '')
-            .replace(/\s+(AND|OR)\s*$/i, '')
-            .replace(/\s{2,}/g, ' ')
-            .trim();
-          const clause = `${dim}:${value}`;
-          return { ...s, filter: cleaned ? `${cleaned} AND ${clause}` : clause };
+          let f = s.filter.trim();
+          // Pass 1: remove whole parenthesized groups containing this dim
+          f = f.replace(new RegExp(`\\([^)]*\\b${dim}:[^)]*\\)`, 'gi'), '');
+          // Pass 2: remove standalone dim: clauses (positive, NOT, with leading AND/OR)
+          f = f.replace(new RegExp(`(?:AND\\s+|OR\\s+)?(?:NOT\\s+)?\\b${dim}:[A-Za-z0-9_,./:-]+`, 'gi'), '');
+          // Clean up dangling connectors and extra whitespace
+          f = f.replace(/^\s*(AND|OR)\s+/i, '')
+               .replace(/\s+(AND|OR)\s*$/i, '')
+               .replace(/\s+(AND|OR)\s+(AND|OR)\s+/gi, ' $2 ')
+               .replace(/\s{2,}/g, ' ')
+               .trim();
+          const needsQuoting = /[^A-Za-z0-9_,./:|-]/.test(value);
+          const clause = needsQuoting ? `${dim}:"${value}"` : `${dim}:${value}`;
+          return { ...s, filter: f ? `${f} AND ${clause}` : clause };
         });
       };
 
       const activeFilters = useMemo(() => {
         const out = {};
         if (!qstate.filter) return out;
-        const re = /(?:^|(?:AND|OR)\s+)(?!NOT\s)([A-Za-z_][A-Za-z0-9_]*):([A-Za-z0-9_,./:-]+)/gi;
+        // Match both quoted values (dim:"val") and unquoted (dim:val), skip NOT clauses
+        const re = /(?:^|\s+(?:AND|OR)\s+)(?!NOT\s)([A-Za-z_][A-Za-z0-9_]*):(?:"([^"]+)"|([A-Za-z0-9_,./:-]+))/gi;
         let m;
         while ((m = re.exec(qstate.filter)) !== null) {
-          out[m[1]] = new Set(m[2].split(','));
+          const val = m[2] ?? m[3];
+          out[m[1]] = new Set(val.split(','));
         }
         return out;
       }, [qstate.filter]);
@@ -1078,7 +1092,6 @@
       const recall = (item) => {
         setQstate(item.state);
         setHistoryOpen(false);
-        setTimeout(() => runQueryRef.current(), 50);
       };
 
       const compareItem = compareWith ? history.find(h => h.id === compareWith) : null;
