@@ -4,6 +4,8 @@ An experiment: what does the smallest useful pre-aggregated analytics index over
 
 No broker fork. No schema changes. No fleet of OLAP services. One YAML, one process, one HTTP endpoint.
 
+![KRI Explorer — bitmap-indexed stream analytics](docs/screenshot.png)
+
 ## The problem
 
 Kafka is a log. Analytics questions are not log questions.
