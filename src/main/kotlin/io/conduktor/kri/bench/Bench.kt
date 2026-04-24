@@ -24,6 +24,12 @@ fun main(args: Array<String>) {
     val nPartitions = opts["partitions"]?.toInt() ?: 4
     val serve = "serve" in opts || args.contains("--serve")
 
+    require(nEvents > 0) { "events must be > 0" }
+    require(nBuckets > 0) { "buckets must be > 0" }
+    require(nUsers > 0) { "users must be > 0" }
+    require(nPaths > 0) { "paths must be > 0" }
+    require(nPartitions > 0) { "partitions must be > 0" }
+
     println("bench: events=$nEvents buckets=$nBuckets partitions=$nPartitions users=$nUsers paths=$nPaths")
 
     val cfg = ConfigLoader.parseOnly(BENCH_CFG)
@@ -148,6 +154,14 @@ fun main(args: Array<String>) {
     val userW = DoubleArray(nUsers) { i -> 1.0 / (i + 1.0).pow(0.75) }
     cumulate(userW)
 
+    // ── Time buckets (sinusoidal weight: low at edges, peak at midday) ────────
+    val bucketW =
+        DoubleArray(nBuckets) { i ->
+            val phase = (i + 0.5) / nBuckets
+            0.5 - 0.42 * cos(phase * 2.0 * PI)
+        }
+    cumulate(bucketW)
+
     // ── Ingest ───────────────────────────────────────────────────────────────
     val rnd = SplittableRandom(42)
     val ingestStart = System.nanoTime()
@@ -155,12 +169,8 @@ fun main(args: Array<String>) {
     val batch = HashMap<String, Any?>(14)
 
     for (i in 0L until nEvents) {
-        // Sinusoidal time: traffic builds up then fades — peaks around bucket 7-8
-        val tNorm = i.toDouble() / nEvents
-        val tBias = 0.5 - 0.42 * cos(tNorm * 2.0 * PI)
-        val ts =
-            (t0 + (tBias * nBuckets * bucketMs).toLong() + rnd.nextLong(120_000L))
-                .coerceIn(t0, tEnd - 1)
+        val bucketIdx = pickFast(rnd.nextDouble(), bucketW)
+        val ts = t0 + bucketIdx * bucketMs + rnd.nextLong(bucketMs)
 
         val user = pickFast(rnd.nextDouble(), userW)
         val countryIdx = pickFast(rnd.nextDouble(), countryW)
@@ -368,6 +378,7 @@ private fun logNormal(
 }
 
 private fun cumulate(w: DoubleArray) {
+    if (w.isEmpty()) return
     var s = 0.0
     for (i in w.indices) {
         s += w[i]
