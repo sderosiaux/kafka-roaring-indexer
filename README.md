@@ -99,6 +99,7 @@ A few choices that aren't obvious:
 - **Filter grammar kept minimal.** AND / OR / NOT / IN, values expanded inside a dimension. Range predicates collapse into bucketed numeric dims (`linear` / `exponential` / `explicit`), which means range queries reduce to Roaring `OR` over pre-computed bucket bitmaps.
 - **Portable Roaring on disk.** `.rbi` files are cross-language inspectable — no runtime lock-in.
 - **Member dictionary is append-only, ever.** Cardinality guards per dimension, with `reject` / `overflow` / `halt` semantics. A dim blowing up its cardinality does not silently poison the segment.
+- **Queries fan out, writes keep flowing.** Segment evaluation is a pure map/reduce: per-segment filter → `RoaringBitmap`, then `FastAggregation.or` across segments. Above a configurable threshold (`query.parallelThreshold`, default 8) the fan-out goes parallel on a dedicated `ForkJoinPool` sized by `query.parallelism`. Frozen segments are handed out as-is (their bitmaps are immutable); the currently-open segment is read under a read-lock that clones each touched bitmap so a concurrent `bitmap.add()` on the writer thread cannot corrupt the query's view. Single-writer, many-readers, no stop-the-world.
 
 Deliberately skipped in v1, flagged in the task list: ART backing for the dict (prefix filters + radix compression on clustered keys), `Int2ObjectOpenHashMap` for the value-id map (quick RAM win), Z-order for multi-range numeric dims.
 
@@ -116,21 +117,28 @@ GET /query
 { "segments": 24, "matched": 48211, "result": 48211, "metric": "cardinality", "approx": false }
 ```
 
-Under the hood: find the segments overlapping `[from, to)`, reduce the filter AST to a Roaring bitmap per segment using pre-built dim-value bitmaps, then either `OR` the member sets across segments (exact cardinality when member id is stable across buckets, e.g. `raw_uint32` or `hash64`), or merge pre-computed ULL sketches (approximate, with exact-slice-match required if the filter doesn't match the precomputed `sliceBy`).
+Under the hood: find the segments overlapping `[from, to)`, **fan out** filter evaluation across them (parallel on `ForkJoinPool` once `segments.size ≥ parallelThreshold`), each segment reduces the filter AST into a `RoaringBitmap` from its pre-built dim-value bitmaps, then **gather** via `FastAggregation.or` — the cache-aware multi-way union beats a sequential fold. For cardinality the result is `.cardinality()` of the merged bitmap; for ULL metrics we either merge pre-computed sketches (approximate, requires exact-slice-match) or rebuild exactly from the matched bitmap when `metric.field == member.field`.
 
 ```mermaid
 flowchart TD
   Q[GET /query] --> P[parse filter AST<br/>AND / OR / NOT / IN]
   P --> F[segmentsOverlapping<br/>from..to]
-  F --> R["per segment s:<br/>reduce AST → RoaringBitmap(s)"]
-  R --> A{agg}
-  A -->|cardinality| U["OR bitmaps<br/>across segments<br/>→ .cardinality()"]
-  A -->|count| SC["sum bitmap cardinalities<br/>or stored count metric"]
-  A -->|ULL metric| M["if field == member:<br/>exact via bitmap<br/>else: merge sketches<br/>(requires sliceBy match)"]
+  F -->|fan-out<br/>ForkJoinPool| R1["seg 1:<br/>reduce AST → bitmap"]
+  F --> R2["seg 2:<br/>reduce AST → bitmap"]
+  F --> R3["seg N:<br/>reduce AST → bitmap"]
+  R1 --> G[FastAggregation.or<br/>cache-aware union]
+  R2 --> G
+  R3 --> G
+  G --> A{agg}
+  A -->|cardinality| U[".cardinality()"]
+  A -->|count| SC[sum / stored counter]
+  A -->|ULL metric| M["merge sketches (if sliceBy matches)<br/>OR exact via bitmap (if field == member)"]
   U --> O[JSON response]
   SC --> O
   M --> O
 ```
+
+Concurrency with the writer: the consumer thread keeps ingesting into the open segment while queries run. Frozen segments are bitmap-immutable (no lock needed). The open segment is queried under a shared read-lock that clones each touched bitmap inside the lock window — the writer continues to mutate the live bitmaps under a per-bitmap `synchronized` guard, and the query operates on snapshots. Reads and writes don't serialize against each other; only `freeze()` (rollover) takes the write-lock and waits for in-flight reads to finish.
 
 ## Prior art, positioning
 

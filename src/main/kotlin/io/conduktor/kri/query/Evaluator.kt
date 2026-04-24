@@ -6,8 +6,10 @@ import io.conduktor.kri.config.Metric
 import io.conduktor.kri.index.DictEncoder
 import io.conduktor.kri.index.RawUInt32Encoder
 import io.conduktor.kri.index.Segment
+import org.roaringbitmap.FastAggregation
 import org.roaringbitmap.RoaringBitmap
 import java.time.Instant
+import java.util.concurrent.ForkJoinPool
 
 data class QueryRequest(
     val from: Instant,
@@ -27,6 +29,31 @@ data class QueryResponse(
 class Evaluator(
     private val cfg: IndexerConfig,
 ) {
+    private val poolLazy =
+        lazy {
+            val p = cfg.query.parallelism ?: Runtime.getRuntime().availableProcessors()
+            if (p <= 1) ForkJoinPool(1) else ForkJoinPool(p)
+        }
+    private val pool: ForkJoinPool by poolLazy
+
+    private fun evalPerSegment(
+        segments: List<Segment>,
+        filter: FilterAst,
+    ): List<RoaringBitmap> {
+        val threshold = cfg.query.parallelThreshold
+        if (segments.size < threshold || cfg.query.parallelism == 1) {
+            return segments.map { evalFilter(it, filter) }
+        }
+        // Parallel fan-out on a dedicated pool so we don't pollute commonPool.
+        return pool
+            .submit<List<RoaringBitmap>> {
+                segments
+                    .parallelStream()
+                    .map { evalFilter(it, filter) }
+                    .toList()
+            }.get()
+    }
+
     fun evaluate(
         segments: List<Segment>,
         req: QueryRequest,
@@ -35,27 +62,28 @@ class Evaluator(
 
         when {
             req.agg == "cardinality" -> {
-                val perSegBitmaps = segments.map { seg -> evalFilter(seg, req.filter) }
-                val unionBytes = RoaringBitmap()
-                perSegBitmaps.forEach { unionBytes.or(it) }
-                // Cross-segment cardinality: we can't union uint32 member ids across segments
-                // as one user, because ids may differ when member.encoding != raw_uint32.
-                // For raw_uint32 or hash64, same input → same id → union is safe.
-                val xs = perSegBitmaps.sumOf { it.longCardinality.toLong() }
-                val unionCard = unionBytes.longCardinality.toLong()
+                val perSegBitmaps = evalPerSegment(segments, req.filter)
+                // FastAggregation.or is cache-aware; vastly better than sequential .or() fold.
+                // Cross-segment cardinality: uint32 member ids are stable across segments only for
+                // raw_uint32 and hash64 encodings. For dict encoding the union is NOT equivalent
+                // to a distinct-count (ids differ per segment dict) — noted limitation for v1.
+                val unionBitmap =
+                    if (perSegBitmaps.isEmpty()) {
+                        RoaringBitmap()
+                    } else {
+                        FastAggregation.or(*perSegBitmaps.toTypedArray())
+                    }
                 return QueryResponse(
                     segmentCount = segments.size,
                     matchedRecords = perSegBitmaps.sumOf { it.longCardinality.toLong() },
-                    result = unionCard,
+                    result = unionBitmap.longCardinality.toLong(),
                     metric = "cardinality",
                     approx = false,
-                ).also { _ ->
-                    if (xs == unionCard) Unit // consistent
-                }
+                )
             }
 
             req.agg == "count" -> {
-                val matched = segments.map { seg -> evalFilter(seg, req.filter) }
+                val matched = evalPerSegment(segments, req.filter)
                 val total = matched.sumOf { it.longCardinality.toLong() }
                 return QueryResponse(segments.size, total, total, "count", false)
             }
@@ -106,8 +134,13 @@ class Evaluator(
 
         // Case with filter: if metric.field == member.field, derive from bitmap (exact).
         if (metric.field == cfg.member.field) {
-            val union = RoaringBitmap()
-            segments.forEach { seg -> union.or(evalFilter(seg, req.filter)) }
+            val matched = evalPerSegment(segments, req.filter)
+            val union =
+                if (matched.isEmpty()) {
+                    RoaringBitmap()
+                } else {
+                    FastAggregation.or(*matched.toTypedArray())
+                }
             return QueryResponse(segments.size, union.longCardinality.toLong(), union.longCardinality.toLong(), metric.name, false)
         }
 
@@ -118,7 +151,12 @@ class Evaluator(
         )
     }
 
-    /** Reduces the filter to a RoaringBitmap within one segment. */
+    /**
+     * Reduces the filter to a RoaringBitmap within one segment.
+     * Uses [Segment.dimValueBitmap] / [Segment.memberUniverse] which snapshot (clone) bitmaps
+     * on open segments under the segment read-lock; frozen segments return bitmaps directly.
+     * Result is a fresh bitmap owned by the caller — safe to hand to FastAggregation.or.
+     */
     fun evalFilter(
         seg: Segment,
         ast: FilterAst,
@@ -142,6 +180,10 @@ class Evaluator(
                 RoaringBitmap.andNot(universe, inner)
             }
         }
+
+    fun shutdown() {
+        if (poolLazy.isInitialized()) pool.shutdown()
+    }
 
     private fun predicateToBitmap(
         seg: Segment,

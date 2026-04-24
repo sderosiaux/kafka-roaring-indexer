@@ -169,7 +169,9 @@
           "additionalProperties": false
         },
         "maxSegmentsPerQuery": { "type": "integer", "minimum": 1 },
-        "cachePlans":          { "type": "boolean", "default": true }
+        "cachePlans":          { "type": "boolean", "default": true },
+        "parallelism":         { "type": "integer", "minimum": 1 },
+        "parallelThreshold":   { "type": "integer", "minimum": 1, "default": 8 }
       },
       "additionalProperties": false
     },

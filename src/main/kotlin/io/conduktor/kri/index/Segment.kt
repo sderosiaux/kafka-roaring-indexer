@@ -30,23 +30,23 @@ class Segment(
     @Volatile var frozen: Boolean = false
         private set
 
-    /** dimName → (valueId → bitmap(members)) */
-    val dims: MutableMap<String, MutableMap<Int, RoaringBitmap>> = HashMap()
+    /** dimName → (valueId → bitmap(members)). Both levels use ConcurrentHashMap for safe reads during writes. */
+    val dims: MutableMap<String, MutableMap<Int, RoaringBitmap>> = ConcurrentHashMap()
 
     /** metricName → (slice → sketch/state) */
-    val ullSketches: MutableMap<String, MutableMap<List<Int>, UltraLogLog>> = HashMap()
-    val counters: MutableMap<String, AtomicLong> = HashMap()
-    val sums: MutableMap<String, AtomicLong> = HashMap()
+    val ullSketches: MutableMap<String, MutableMap<List<Int>, UltraLogLog>> = ConcurrentHashMap()
+    val counters: MutableMap<String, AtomicLong> = ConcurrentHashMap()
+    val sums: MutableMap<String, AtomicLong> = ConcurrentHashMap()
 
     /** partition → (first, last) offsets */
     val offsets: MutableMap<Int, LongRange> = ConcurrentHashMap()
     val recordCount = AtomicLong(0)
 
     init {
-        dimSpecs.forEach { dims[it.name] = HashMap() }
+        dimSpecs.forEach { dims[it.name] = ConcurrentHashMap() }
         metricSpecs.forEach { m ->
             when (m.type) {
-                Metric.Type.ULL -> ullSketches[m.name] = HashMap()
+                Metric.Type.ULL -> ullSketches[m.name] = ConcurrentHashMap()
                 Metric.Type.COUNT -> counters[m.name] = AtomicLong(0)
                 Metric.Type.SUM -> sums[m.name] = AtomicLong(0)
                 else -> { /* hll/cpc: omitted in v1 */ }
@@ -135,17 +135,41 @@ class Segment(
         }
     }
 
+    /**
+     * Read-safe snapshot of a single dim-value bitmap.
+     * Frozen segment → returns the live (immutable) bitmap directly, no copy.
+     * Open segment → clones under read-lock so concurrent add() cannot corrupt the view.
+     */
     fun dimValueBitmap(
         dim: String,
         value: Int,
-    ): RoaringBitmap? = dims[dim]?.get(value)
+    ): RoaringBitmap? {
+        val live = dims[dim]?.get(value) ?: return null
+        if (frozen) return live
+        return lock.read { synchronized(live) { live.clone() } }
+    }
 
     fun dimValues(dim: String): Set<Int> = dims[dim]?.keys ?: emptySet()
 
+    /**
+     * Member universe: OR of every dim's bitmaps. On open segments, clones each bitmap
+     * before folding so concurrent writes can't mutate mid-scan.
+     */
     fun memberUniverse(): RoaringBitmap {
-        val all = RoaringBitmap()
-        dims.values.forEach { vm -> vm.values.forEach { all.or(it) } }
-        return all
+        if (frozen) {
+            val all = RoaringBitmap()
+            dims.values.forEach { vm -> vm.values.forEach { all.or(it) } }
+            return all
+        }
+        return lock.read {
+            val all = RoaringBitmap()
+            dims.values.forEach { vm ->
+                vm.values.forEach { bm ->
+                    synchronized(bm) { all.or(bm) }
+                }
+            }
+            all
+        }
     }
 
     fun dimEncoder(dim: String): DimEncoder? = dimEncoders[dim]

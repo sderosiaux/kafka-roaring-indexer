@@ -53,6 +53,7 @@ fun main(args: Array<String>) {
             log.info("Shutdown initiated")
             runCatching { consumer.stop() }
             runCatching { http.stop() }
+            runCatching { evaluator.shutdown() }
         },
     )
 

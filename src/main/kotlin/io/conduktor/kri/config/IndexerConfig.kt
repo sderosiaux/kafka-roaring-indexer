@@ -298,6 +298,10 @@ data class Query(
     val http: HttpQuery = HttpQuery(),
     val maxSegmentsPerQuery: Int = 720,
     val cachePlans: Boolean = true,
+    /** Max threads for per-segment fan-out. null = availableProcessors(). 1 = force sequential. */
+    val parallelism: Int? = null,
+    /** Segments >= this threshold switch to parallel eval; below, sequential (overhead avoidance). */
+    val parallelThreshold: Int = 8,
 )
 
 @Serializable
