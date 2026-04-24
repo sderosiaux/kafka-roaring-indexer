@@ -136,3 +136,14 @@ tasks.register<JavaExec>("runIndexer") {
     mainClass.set("io.conduktor.kri.MainKt")
     args("--config", "examples/events-analytics.yaml")
 }
+
+tasks.register<JavaExec>("runBench") {
+    group = "application"
+    description = "In-process ingest + query benchmark. Pass args via -Pargs='--events 20000000 --buckets 6'"
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("io.conduktor.kri.bench.BenchKt")
+    jvmArgs = listOf("-Xms2g", "-Xmx6g", "-XX:+UseG1GC")
+    val extra = (project.findProperty("args") as String?)?.split(" ")?.filter { it.isNotBlank() } ?: emptyList()
+    args(extra)
+    standardInput = System.`in`
+}
