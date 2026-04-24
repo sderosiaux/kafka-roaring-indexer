@@ -69,7 +69,7 @@ class IndexerConsumer(
                         }
                     val fields = extractor.extract(payload)
                     val ts = resolveTimestamp(fields, rec.timestamp())
-                    val seg = store.segmentFor(ts)
+                    val seg = store.segmentFor(rec.partition(), ts)
                     when (val r = seg.add(rec.partition(), rec.offset(), fields)) {
                         Segment.AddResult.Ok -> {}
                         is Segment.AddResult.Overflow -> log.debug("dim overflow {}", r.dims)

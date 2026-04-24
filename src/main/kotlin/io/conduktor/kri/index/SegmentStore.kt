@@ -9,8 +9,9 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 
 /**
- * Owns the set of live (open) and frozen segments in memory.
- * Handles time-bucket alignment and rollover.
+ * Owns open + frozen segments, keyed by (partition, bucketStart).
+ * One segment covers one partition × one time bucket. Cross-partition queries
+ * fan out to all matching segments and union the bitmaps.
  */
 class SegmentStore(
     private val cfg: IndexerConfig,
@@ -19,10 +20,15 @@ class SegmentStore(
     private val log = LoggerFactory.getLogger(javaClass)
     private val nextId = AtomicLong(0)
 
-    /** bucketStart (epoch ms aligned) → Segment. Open buckets only. */
-    private val open = ConcurrentHashMap<Long, Segment>()
+    data class PartBucket(
+        val partition: Int,
+        val bucketStartMs: Long,
+    )
 
-    /** All frozen segments in memory (loaded or recent). */
+    /** (partition, bucketStart) → Segment. Open buckets only. */
+    private val open = ConcurrentHashMap<PartBucket, Segment>()
+
+    /** segmentId → frozen Segment. */
     private val frozen = ConcurrentHashMap<Long, Segment>()
 
     fun bucketStart(ts: Instant): Instant {
@@ -35,13 +41,16 @@ class SegmentStore(
         return Instant.ofEpochMilli(alignedMs)
     }
 
-    fun segmentFor(ts: Instant): Segment {
+    fun segmentFor(
+        partition: Int,
+        ts: Instant,
+    ): Segment {
         val start = bucketStart(ts)
-        val key = start.toEpochMilli()
+        val key = PartBucket(partition, start.toEpochMilli())
         return open.computeIfAbsent(key) { k ->
-            val end = Instant.ofEpochMilli(k).plus(bucket)
-            val seg = Segment.create(nextId.getAndIncrement(), Instant.ofEpochMilli(k), end, cfg)
-            log.info("Opened segment id={} [{} .. {})", seg.id, seg.tStart, seg.tEnd)
+            val end = Instant.ofEpochMilli(k.bucketStartMs).plus(bucket)
+            val seg = Segment.create(nextId.getAndIncrement(), k.partition, Instant.ofEpochMilli(k.bucketStartMs), end, cfg)
+            log.info("Opened segment id={} partition={} [{} .. {})", seg.id, seg.partition, seg.tStart, seg.tEnd)
             seg
         }
     }
@@ -56,17 +65,30 @@ class SegmentStore(
             open.remove(k)
             seg.freeze()
             frozen[seg.id] = seg
-            log.info("Rolled segment id={} records={} [{} .. {})", seg.id, seg.recordCount.get(), seg.tStart, seg.tEnd)
+            log.info(
+                "Rolled segment id={} partition={} records={} [{} .. {})",
+                seg.id,
+                seg.partition,
+                seg.recordCount.get(),
+                seg.tStart,
+                seg.tEnd,
+            )
             onRoll(seg)
         }
     }
 
-    fun allSegments(): List<Segment> = (frozen.values + open.values).sortedBy { it.tStart }
+    fun allSegments(): List<Segment> = (frozen.values + open.values).sortedWith(compareBy({ it.tStart }, { it.partition }))
 
     fun segmentsOverlapping(
         from: Instant,
         to: Instant,
-    ): List<Segment> = allSegments().filter { it.tStart.isBefore(to) && it.tEnd.isAfter(from) }
+        partitions: Set<Int>? = null,
+    ): List<Segment> =
+        allSegments().filter { s ->
+            s.tStart.isBefore(to) &&
+                s.tEnd.isAfter(from) &&
+                (partitions == null || s.partition in partitions)
+        }
 
     fun forceRollAll(onRoll: (Segment) -> Unit = {}) {
         val all = open.values.toList()
@@ -80,6 +102,7 @@ class SegmentStore(
 
     fun registerFrozen(seg: Segment) {
         frozen[seg.id] = seg
+        if (seg.id >= nextId.get()) nextId.set(seg.id + 1)
     }
 
     fun size(): Int = open.size + frozen.size

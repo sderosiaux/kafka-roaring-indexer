@@ -34,7 +34,7 @@ class ConcurrentQueryTest {
 
     @Test
     fun `concurrent writes do not corrupt reads on open segment`() {
-        val seg = Segment.create(0, Instant.EPOCH, Instant.EPOCH.plusSeconds(3600), cfg)
+        val seg = Segment.create(0, 0, Instant.EPOCH, Instant.EPOCH.plusSeconds(3600), cfg)
         val ev = Evaluator(cfg)
         val writers = 4
         val recordsPerWriter = 50_000
@@ -136,6 +136,7 @@ class ConcurrentQueryTest {
                 val seg =
                     Segment.create(
                         i.toLong(),
+                        0,
                         Instant.EPOCH.plusSeconds(i * 3600L),
                         Instant.EPOCH.plusSeconds((i + 1) * 3600L),
                         seqCfg,

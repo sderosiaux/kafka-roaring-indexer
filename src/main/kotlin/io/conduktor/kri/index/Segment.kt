@@ -15,6 +15,7 @@ import kotlin.concurrent.write
 /** Immutable once frozen. Before freeze, thread-safe for concurrent add(). */
 class Segment(
     val id: Long,
+    val partition: Int,
     val tStart: Instant,
     val tEnd: Instant,
     private val dimSpecs: List<Dimension>,
@@ -191,6 +192,7 @@ class Segment(
     companion object {
         fun create(
             id: Long,
+            partition: Int,
             tStart: Instant,
             tEnd: Instant,
             cfg: IndexerConfig,
@@ -214,6 +216,7 @@ class Segment(
             val metricFields = cfg.metrics.associate { it.name to it.field?.let { f -> cfg.fields[f]?.path?.let { _ -> f } } }
             return Segment(
                 id = id,
+                partition = partition,
                 tStart = tStart,
                 tEnd = tEnd,
                 dimSpecs = cfg.dimensions,

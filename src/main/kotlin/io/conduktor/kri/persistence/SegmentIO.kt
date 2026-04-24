@@ -37,14 +37,16 @@ class SegmentIO(
     private val json = ObjectMapper().registerKotlinModule()
     private val root: Path = Path.of(cfg.storage.path)
     private val segmentsDir: Path = root.resolve("segments")
+    val manifest: SegmentManifest = SegmentManifest(root)
 
     init {
         Files.createDirectories(segmentsDir)
     }
 
     fun write(seg: Segment) {
-        val dir = segmentsDir.resolve(dirName(seg))
-        val tmp = segmentsDir.resolve(dirName(seg) + ".tmp")
+        val dn = dirName(seg)
+        val dir = segmentsDir.resolve(dn)
+        val tmp = segmentsDir.resolve("$dn.tmp")
         if (Files.exists(tmp)) deleteRecursively(tmp)
         Files.createDirectories(tmp.resolve("dims"))
         Files.createDirectories(tmp.resolve("dicts"))
@@ -58,14 +60,37 @@ class SegmentIO(
         fsyncTree(tmp)
         if (Files.exists(dir)) deleteRecursively(dir)
         Files.move(tmp, dir, StandardCopyOption.ATOMIC_MOVE)
-        log.info("Persisted segment {} to {}", seg.id, dir)
+        manifest.upsert(SegmentManifest.segmentToEntry(seg, dn))
+        log.info("Persisted segment {} partition={} to {}", seg.id, seg.partition, dir)
     }
 
     fun loadAll(
         store: io.conduktor.kri.index.SegmentStore,
         nextId: AtomicLong,
     ) {
+        val entries = manifest.load()
+        if (entries.isNotEmpty()) {
+            entries.forEach { e ->
+                val dir = segmentsDir.resolve(e.dir)
+                runCatching {
+                    val seg = read(dir)
+                    store.registerFrozen(seg)
+                    if (seg.id >= nextId.get()) nextId.set(seg.id + 1)
+                    log.info(
+                        "Loaded segment {} partition={} records={} [{} .. {}) (via manifest)",
+                        seg.id,
+                        seg.partition,
+                        seg.recordCount.get(),
+                        seg.tStart,
+                        seg.tEnd,
+                    )
+                }.onFailure { log.warn("manifest entry {} unreadable: {}", dir, it.message) }
+            }
+            return
+        }
+        // Fallback: scan directory (legacy / manifest missing).
         if (!Files.exists(segmentsDir)) return
+        val rebuilt = mutableListOf<SegmentManifest.Entry>()
         Files.list(segmentsDir).use { stream ->
             stream
                 .filter { Files.isDirectory(it) && !it.fileName.toString().endsWith(".tmp") }
@@ -75,13 +100,23 @@ class SegmentIO(
                         val seg = read(dir)
                         store.registerFrozen(seg)
                         if (seg.id >= nextId.get()) nextId.set(seg.id + 1)
-                        log.info("Loaded segment {} records={} [{} .. {})", seg.id, seg.recordCount.get(), seg.tStart, seg.tEnd)
+                        rebuilt.add(SegmentManifest.segmentToEntry(seg, dir.fileName.toString()))
+                        log.info(
+                            "Loaded segment {} partition={} records={} [{} .. {}) (via scan)",
+                            seg.id,
+                            seg.partition,
+                            seg.recordCount.get(),
+                            seg.tStart,
+                            seg.tEnd,
+                        )
                     }.onFailure { log.warn("skip segment at {}: {}", dir, it.message) }
                 }
         }
+        if (rebuilt.isNotEmpty()) manifest.save(rebuilt)
     }
 
-    private fun dirName(seg: Segment): String = "seg_${"%020d".format(seg.id)}_${seg.tStart.toEpochMilli()}_${seg.tEnd.toEpochMilli()}"
+    private fun dirName(seg: Segment): String =
+        "seg_${"%020d".format(seg.id)}_p${"%05d".format(seg.partition)}_${seg.tStart.toEpochMilli()}_${seg.tEnd.toEpochMilli()}"
 
     private fun writeMeta(
         seg: Segment,
@@ -90,6 +125,7 @@ class SegmentIO(
         val meta =
             mapOf(
                 "id" to seg.id,
+                "partition" to seg.partition,
                 "tStartMs" to seg.tStart.toEpochMilli(),
                 "tEndMs" to seg.tEnd.toEpochMilli(),
                 "recordCount" to seg.recordCount.get(),
@@ -183,9 +219,10 @@ class SegmentIO(
     fun read(dir: Path): Segment {
         val meta = json.readTree(Files.readAllBytes(dir.resolve("meta.json")))
         val id = meta.get("id").asLong()
+        val partition = meta.get("partition")?.asInt() ?: 0
         val tStart = Instant.ofEpochMilli(meta.get("tStartMs").asLong())
         val tEnd = Instant.ofEpochMilli(meta.get("tEndMs").asLong())
-        val seg = Segment.create(id, tStart, tEnd, cfg)
+        val seg = Segment.create(id, partition, tStart, tEnd, cfg)
 
         // Restore dicts BEFORE dims so dict encoders know their ids.
         val dictsDir = dir.resolve("dicts")

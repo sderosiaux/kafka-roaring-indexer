@@ -37,7 +37,7 @@ class SegmentIOTest {
             storage: { path: $tmp }
             """.trimIndent()
         val cfg = ConfigLoader.parseOnly(yaml)
-        val seg = Segment.create(0, Instant.EPOCH, Instant.EPOCH.plusSeconds(3600), cfg)
+        val seg = Segment.create(0, 0, Instant.EPOCH, Instant.EPOCH.plusSeconds(3600), cfg)
         seg.add(0, 0, mapOf("userId" to 1L, "country" to "FR"))
         seg.add(0, 1, mapOf("userId" to 2L, "country" to "FR"))
         seg.add(0, 2, mapOf("userId" to 3L, "country" to "DE"))

@@ -38,7 +38,7 @@ class SegmentTest {
     fun `add and filter single dim`() {
         val c = cfg()
         val t0 = Instant.parse("2026-04-24T10:00:00Z")
-        val seg = Segment.create(0, t0, t0.plusSeconds(3600), c)
+        val seg = Segment.create(0, 0, t0, t0.plusSeconds(3600), c)
         seg.add(0, 0, mapOf("userId" to 1L, "country" to "FR", "device" to "mobile"))
         seg.add(0, 1, mapOf("userId" to 2L, "country" to "FR", "device" to "desktop"))
         seg.add(0, 2, mapOf("userId" to 3L, "country" to "DE", "device" to "mobile"))
@@ -52,7 +52,7 @@ class SegmentTest {
     @Test
     fun `AND filter across dims`() {
         val c = cfg()
-        val seg = Segment.create(0, Instant.EPOCH, Instant.EPOCH.plusSeconds(3600), c)
+        val seg = Segment.create(0, 0, Instant.EPOCH, Instant.EPOCH.plusSeconds(3600), c)
         seg.add(0, 0, mapOf("userId" to 1L, "country" to "FR", "device" to "mobile"))
         seg.add(0, 1, mapOf("userId" to 2L, "country" to "FR", "device" to "desktop"))
         seg.add(0, 2, mapOf("userId" to 3L, "country" to "DE", "device" to "mobile"))
@@ -65,7 +65,7 @@ class SegmentTest {
     @Test
     fun `OR expansion on dim values`() {
         val c = cfg()
-        val seg = Segment.create(0, Instant.EPOCH, Instant.EPOCH.plusSeconds(3600), c)
+        val seg = Segment.create(0, 0, Instant.EPOCH, Instant.EPOCH.plusSeconds(3600), c)
         seg.add(0, 0, mapOf("userId" to 1L, "country" to "FR", "device" to "mobile"))
         seg.add(0, 1, mapOf("userId" to 2L, "country" to "DE", "device" to "desktop"))
         seg.add(0, 2, mapOf("userId" to 3L, "country" to "IT", "device" to "mobile"))
@@ -78,7 +78,7 @@ class SegmentTest {
     @Test
     fun `NOT flip`() {
         val c = cfg()
-        val seg = Segment.create(0, Instant.EPOCH, Instant.EPOCH.plusSeconds(3600), c)
+        val seg = Segment.create(0, 0, Instant.EPOCH, Instant.EPOCH.plusSeconds(3600), c)
         seg.add(0, 0, mapOf("userId" to 1L, "country" to "FR", "device" to "mobile"))
         seg.add(0, 1, mapOf("userId" to 2L, "country" to "DE", "device" to "desktop"))
         seg.add(0, 2, mapOf("userId" to 3L, "country" to "IT", "device" to "mobile"))
@@ -91,7 +91,7 @@ class SegmentTest {
     @Test
     fun `cardinality query returns distinct user count`() {
         val c = cfg()
-        val seg = Segment.create(0, Instant.EPOCH, Instant.EPOCH.plusSeconds(3600), c)
+        val seg = Segment.create(0, 0, Instant.EPOCH, Instant.EPOCH.plusSeconds(3600), c)
         repeat(10) { i ->
             seg.add(0, i.toLong(), mapOf("userId" to (i % 5).toLong(), "country" to "FR", "device" to "mobile"))
         }
@@ -103,7 +103,7 @@ class SegmentTest {
     @Test
     fun `count metric accumulates`() {
         val c = cfg()
-        val seg = Segment.create(0, Instant.EPOCH, Instant.EPOCH.plusSeconds(3600), c)
+        val seg = Segment.create(0, 0, Instant.EPOCH, Instant.EPOCH.plusSeconds(3600), c)
         repeat(7) { i -> seg.add(0, i.toLong(), mapOf("userId" to i.toLong(), "country" to "FR", "device" to "mobile")) }
         val ev = Evaluator(c)
         val resp = ev.evaluate(listOf(seg), QueryRequest(Instant.EPOCH, Instant.EPOCH.plusSeconds(3600), FilterAst.True, "requestCount"))
