@@ -207,6 +207,7 @@
     ];
 
     const PRESETS = [
+      { id: "all", label: "All data", ms: null },
       { id: "1h",  label: "Last 1h",  ms: 3600_000 },
       { id: "6h",  label: "Last 6h",  ms: 6*3600_000 },
       { id: "24h", label: "Last 24h", ms: 24*3600_000 },
@@ -214,6 +215,7 @@
     ];
 
     function fromPreset(ms) {
+      if (!ms) return { from: null, to: null };
       const end = new Date(Math.floor(Date.now() / 1000) * 1000);
       const start = new Date(+end - ms);
       return { from: start.toISOString().replace(/\.\d+Z$/, "Z"), to: end.toISOString().replace(/\.\d+Z$/, "Z") };
@@ -291,7 +293,7 @@
           ),
           h("nav", { className:"flex items-center gap-0.5" },
             ["Explorer","Segments","Schema","Settings"].map((n, i) =>
-              h("a", { key: n, href:"#", className: `px-2.5 py-1 rounded-md text-[13px] ${i===0 ? "bg-[color:var(--surface-3)] text-[color:var(--ink)] font-medium" : "text-[color:var(--ink-3)] hover:text-[color:var(--ink)]}` }, n)
+              h("a", { key: n, href:"#", className: `px-2.5 py-1 rounded-md text-[13px] ${i===0 ? "bg-[color:var(--surface-3)] text-[color:var(--ink)] font-medium" : "text-[color:var(--ink-3)] hover:text-[color:var(--ink)]"}` }, n)
             )
           )
         ),
@@ -336,10 +338,12 @@
             ),
             h("div", { className:"mt-2 flex items-center gap-1.5 text-[11.5px] mono text-[color:var(--ink-3)]" },
               h(Icon.clock, { width:12, height:12 }),
-              h("span", null, fmtTime(from.slice(5,16))),
-              h("span", { className:"text-[color:var(--ink-4)]" }, "→"),
-              h("span", null, fmtTime(to.slice(5,16))),
-              h("span", { className:"chip" }, `${Math.round((+new Date(to) - +new Date(from))/3600_000)}h window`)
+              from && to ? h(React.Fragment, null,
+                h("span", null, fmtShortTime(from)),
+                h("span", { className:"text-[color:var(--ink-4)]" }, "→"),
+                h("span", null, fmtShortTime(to)),
+                h("span", { className:"chip" }, `${Math.round((+new Date(to) - +new Date(from))/3600_000)}h window`)
+              ) : h("span", { className:"italic text-[color:var(--ink-4)]" }, "all segments")
             )
           ),
 
@@ -358,9 +362,12 @@
               )
             ),
             h("div", { className:"relative" },
-              h("div", { className:"rounded-lg border hairline-2 bg-[color:var(--surface)] focus-within:border-[color:var(--accent)] focus-within:shadow-[0_0_0_3px_var(--accent-ring)]", style:{ transition:"border-color 120ms, box-shadow 120ms" } },
-                h("div", { className:"relative px-3 py-2" },
-                  h("div", { className:"pointer-events-none absolute inset-0 px-3 py-2" },
+              h("div", { className:"rounded-lg border hairline bg-[color:var(--surface)] focus-within:border-[color:var(--accent)] focus-within:shadow-[0_0_0_3px_var(--accent-ring)]", style:{ transition:"border-color 120ms, box-shadow 120ms" } },
+                h("div", { className:"relative" },
+                  h("div", {
+                    className:"pointer-events-none absolute inset-0 px-3 py-2 overflow-hidden",
+                    "aria-hidden": "true",
+                  },
                     h(HighlightedFilter, { value: filter })
                   ),
                   h("textarea", {
@@ -369,7 +376,7 @@
                     spellCheck: false,
                     rows: 1,
                     className: "mono w-full resize-none bg-transparent outline-none text-transparent caret-[color:var(--ink)] relative",
-                    style: { fontSize: 13, lineHeight: "20px", minHeight: 20 },
+                    style: { fontSize: 13, lineHeight: "20px", minHeight: 20, padding: "8px 12px" },
                     onKeyDown: (e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); onRun(); } }
                   })
                 )
@@ -392,20 +399,7 @@
             )
           ),
 
-          h("div", { className:"w-px self-stretch bg-[color:var(--line)]" }),
-
-          /* Run */
-          h("div", { className:"flex-none" },
-            h(FieldLabel, null, " "),
-            h("button", { className:"btn btn-primary h-[34px] px-5", onClick: onRun, disabled: running },
-              running ? h("span", { className:"flex items-center gap-2" }, h(Spinner, null), "Running…")
-                      : h("span", { className:"flex items-center gap-2" },
-                          h(Icon.play, { width:12, height:12 }),
-                          "Run",
-                          h("span", { className:"mono text-[10.5px] px-1.5 py-0.5 rounded bg-white/20 text-white/90" }, "⌘↵")
-                        )
-            )
-          )
+          running && h("div", { className:"flex-none flex items-end pb-1" }, h(Spinner, null))
         ),
 
         /* Secondary row */
@@ -480,20 +474,26 @@
     /* -------------------------------------------------------------------------- */
     /*  Result card                                                               */
     /* -------------------------------------------------------------------------- */
-    function ResultCard({ result, error, loading, agg, filter, compareItem }) {
+    function AnimatedNumber({ value, fmt: fmtFn }) {
+      const animated = useCountUp(typeof value === "number" ? value : 0);
+      return h(React.Fragment, null, (fmtFn ?? fmtNum)(animated));
+    }
+
+    function ResultCard({ result, error, loading, refreshing, agg, filter, compareItem }) {
       const cur = AGGS.find(a => a.id === agg) || AGGS[0];
       const diff = compareItem && result ? result.value - compareItem.value : 0;
       const pct = compareItem && result && compareItem.value !== 0 ? (diff / compareItem.value) * 100 : 0;
       const up = diff >= 0;
 
-      return h("div", { className:"card relative overflow-hidden" },
+      return h("div", { className:"card relative overflow-hidden", style:{ transition:"opacity 120ms", opacity: refreshing ? 0.7 : 1 } },
         h("div", { className:"absolute inset-0 result-glow pointer-events-none" }),
         h("div", { className:"relative p-5 flex items-stretch gap-6" },
 
           h("div", { className:"flex-none min-w-[280px] flex flex-col justify-between" },
             h("div", { className:"flex items-center gap-2 mb-3" },
               h("span", { className:"text-[11px] font-medium uppercase tracking-wider text-[color:var(--ink-3)]" }, "Result"),
-              h("span", { className:"chip chip-accent" }, cur.label)
+              h("span", { className:"chip chip-accent" }, cur.label),
+              refreshing && h(Spinner, null)
             ),
             loading
               ? h("div", { className:"space-y-2" }, h("div", { className:"skeleton h-14 w-56" }), h("div", { className:"skeleton h-3 w-40" }))
@@ -505,12 +505,14 @@
                 : !result
                   ? h("div", { className:"text-[color:var(--ink-3)] text-[13px]" },
                       h("div", { className:"font-medium text-[color:var(--ink-2)] mb-1" }, "No query run yet"),
-                      h("div", null, "Press ", h("span", { className:"chip" }, "⌘ ↵"), " to execute.")
+                      h("div", null, "Change a filter to execute automatically.")
                     )
-                  : h("div", { className:"count-up", key: result.value },
+                  : h("div", null,
                       h("div", { className:"flex items-baseline gap-3" },
-                        h("div", { className:"font-semibold tracking-tight tabular-nums", style:{ fontSize: 56, lineHeight: 1, letterSpacing:"-0.03em", color:"var(--accent-2)" } }, fmtNum(result.value)),
-                        h("div", { className:"mono text-[12px] text-[color:var(--ink-3)]" }, fmtFull(result.value)),
+                        h("div", { className:"font-semibold tracking-tight tabular-nums", style:{ fontSize: 56, lineHeight: 1, letterSpacing:"-0.03em", color:"var(--accent-2)" } },
+                          h(AnimatedNumber, { value: result.value })
+                        ),
+                        h("div", { className:"mono text-[12px] text-[color:var(--ink-3)]" }, h(AnimatedNumber, { value: result.value, fmt: fmtFull })),
                         result.approx && h("span", { className:"chip chip-accent text-[10px]" }, "~0.8%")
                       ),
                       h("div", { className:"mt-2 text-[13px] text-[color:var(--ink-2)]" }, cur.sub, " matching filter")
@@ -524,7 +526,7 @@
               ["Segments scanned", result ? fmtFull(result.segmentsMatched) : "—", null],
               ["Exec time",        result ? `${result.elapsedMs} ms` : "—",        result && h(Icon.bolt, { width:10, height:10, style:{ color:"var(--warn)" } })],
               ["Matched records",  result ? fmtNum(result.matchedRecords) : "—",   null],
-              ["Window",           result ? `${Math.round((+new Date(result._to || Date.now()) - +new Date(result._from || Date.now()))/3600_000) || "—"}h` : "—", null],
+              ["Window",           result ? (result._from && result._to ? `${Math.round((+new Date(result._to) - +new Date(result._from))/3600_000) || "<1"}h` : "all") : "—", null],
             ].map(([k, v, prefix], i) => h("div", { key: i, className:"min-w-0" },
               h("div", { className:"text-[10.5px] uppercase tracking-wider text-[color:var(--ink-4)] mb-1" }, k),
               h("div", { className:"flex items-center gap-1.5 mono text-[14px] text-[color:var(--ink)] tabular-nums font-medium truncate" }, prefix, v)
@@ -560,13 +562,14 @@
     /* -------------------------------------------------------------------------- */
     /*  Facets                                                                    */
     /* -------------------------------------------------------------------------- */
-    function FacetsPanel({ facets, error, loading, topN, onAddFilter }) {
+    function FacetsPanel({ facets, error, loading, refreshing, topN, onAddFilter, activeFilters }) {
       const dimensions = facets ? Object.keys(facets) : [];
-      return h("div", { className:"card" },
+      return h("div", { className:"card", style:{ transition:"opacity 120ms", opacity: refreshing ? 0.7 : 1 } },
         h("div", { className:"px-5 py-3.5 flex items-center justify-between border-b hairline" },
           h("div", { className:"flex items-center gap-2" },
             h("span", { className:"text-[11px] font-medium uppercase tracking-wider text-[color:var(--ink-3)]" }, "Facets"),
-            facets && h("span", { className:"chip" }, `${dimensions.length} dimensions`)
+            facets && h("span", { className:"chip" }, `${dimensions.length} dimensions`),
+            refreshing && h(Spinner, null)
           ),
           h("div", { className:"flex items-center gap-1.5 text-[11.5px] text-[color:var(--ink-3)]" },
             "Showing top ", h("span", { className:"mono text-[color:var(--ink-2)]" }, topN)
@@ -575,45 +578,59 @@
         error && h("div", { className:"px-5 py-3 text-[12px] text-[color:var(--err)] mono" }, error),
         h("div", { className:"p-5 grid grid-cols-2 gap-x-8 gap-y-6" },
           (dimensions.length > 0 ? dimensions : ["country","device","status","path","userId"]).map(dim =>
-            h(FacetGroup, { key: dim, dim, data: facets?.[dim], loading, onAddFilter })
+            h(FacetGroup, { key: dim, dim, data: facets?.[dim], loading, onAddFilter, activeValues: activeFilters?.[dim] })
           )
         )
       );
     }
 
-    function FacetGroup({ dim, data, loading, onAddFilter }) {
+    function FacetGroup({ dim, data, loading, onAddFilter, activeValues }) {
+      const hasActive = activeValues && activeValues.size > 0;
       return h("div", null,
         h("div", { className:"flex items-baseline justify-between mb-2.5" },
           h("div", { className:"flex items-baseline gap-2" },
-            h("span", { className:"mono text-[12.5px] font-semibold text-[color:var(--ink)]" }, dim),
-            data && h("span", { className:"text-[11px] text-[color:var(--ink-3)] mono" }, fmtNum(data.total), " total")
+            h("span", {
+              className:"mono text-[12.5px] font-semibold",
+              style:{ color: hasActive ? "var(--accent-2)" : "var(--ink)" }
+            }, dim),
+            hasActive && h("span", { className:"chip chip-accent text-[10px]" }, [...activeValues].join(", ")),
+            data && !hasActive && h("span", { className:"text-[11px] text-[color:var(--ink-3)] mono" }, fmtNum(data.total), " total")
           )
         ),
         h("div", { className:"space-y-1" },
-          loading
+          loading && !data
             ? Array.from({length: 5}).map((_, i) => h("div", { key: i, className:"flex items-center gap-2" }, h("div", { className:"skeleton h-[18px] flex-1" })))
             : !data
               ? h("div", { className:"text-[12px] text-[color:var(--ink-3)] italic" }, "Run a query to see facets")
-              : data.items.map((item, i) => h(FacetRow, { key: item.value, item, rank: i, dim, onAddFilter }))
+              : data.items.map((item, i) => h(FacetRow, {
+                  key: item.value, item, rank: i, dim, onAddFilter,
+                  active: activeValues?.has(item.value) ?? false
+                }))
         )
       );
     }
 
-    function FacetRow({ item, rank, dim, onAddFilter }) {
+    function FacetRow({ item, rank, dim, onAddFilter, active }) {
       const pctLabel = (item.pct * 100).toFixed(item.pct < 0.1 ? 2 : 1) + "%";
       return h("button", {
         onClick: () => onAddFilter(dim, item.value),
         className:"group w-full flex items-center gap-2.5 h-[22px] rounded px-1.5 -mx-1.5 hover:bg-[color:var(--surface-2)] transition-colors text-left",
-        style:{ opacity: rank === 0 ? 1 : rank < 3 ? 0.96 : rank < 6 ? 0.92 : 0.86 }
+        style:{
+          opacity: active ? 1 : rank === 0 ? 1 : rank < 3 ? 0.96 : rank < 6 ? 0.92 : 0.82,
+          background: active ? "color-mix(in oklch, var(--accent) 8%, transparent)" : undefined,
+        }
       },
-        h("span", { className:"mono text-[12px] truncate w-[84px] text-[color:var(--ink)]" }, item.value),
+        h("span", {
+          className:"mono text-[12px] truncate w-[84px]",
+          style:{ color: active ? "var(--accent-2)" : "var(--ink)", fontWeight: active ? 600 : 400 }
+        }, item.value),
         h("div", { className:"flex-1 h-[6px] rounded-full bar-track relative overflow-hidden" },
           h("div", {
-            className: rank === 0 ? "bar-fill" : "bar-fill-soft",
+            className: active ? "bar-fill" : rank === 0 ? "bar-fill" : "bar-fill-soft",
             style:{ width: `${Math.max(2, item.pct * 100)}%`, height: "100%", borderRadius: 999, transition: "width 360ms cubic-bezier(.2,.7,.2,1)" }
           })
         ),
-        h("span", { className:"mono text-[11.5px] text-[color:var(--ink-3)] tabular-nums w-[56px] text-right" }, fmtNum(item.count)),
+        h("span", { className:"mono text-[11.5px] tabular-nums w-[56px] text-right", style:{ color: active ? "var(--accent-2)" : "var(--ink-3)" } }, fmtNum(item.count)),
         h("span", { className:"mono text-[11px] text-[color:var(--ink-4)] tabular-nums w-[46px] text-right" }, pctLabel)
       );
     }
@@ -621,7 +638,7 @@
     /* -------------------------------------------------------------------------- */
     /*  Segments heatmap                                                          */
     /* -------------------------------------------------------------------------- */
-    function SegmentsPanel({ segments, loading, onRefresh }) {
+    function SegmentsPanel({ segments, loading, refreshing, onRefresh }) {
       const [view, setView] = useState("heatmap");
       const [hover, setHover] = useState(null);
 
@@ -646,7 +663,7 @@
         return "var(--heat-6)";
       };
 
-      return h("div", { className:"card" },
+      return h("div", { className:"card", style:{ transition:"opacity 120ms", opacity: refreshing ? 0.7 : 1 } },
         h("div", { className:"px-5 py-3.5 flex items-center justify-between border-b hairline" },
           h("div", { className:"flex items-center gap-3" },
             h("span", { className:"text-[11px] font-medium uppercase tracking-wider text-[color:var(--ink-3)]" }, "Segments"),
@@ -667,7 +684,7 @@
         ),
         view === "heatmap"
           ? h("div", { className:"p-5" },
-              loading
+              loading && !segments
                 ? h("div", { className:"skeleton h-[240px]" })
                 : !segments
                   ? h("div", { className:"text-[13px] text-[color:var(--ink-3)] italic py-8 text-center" }, "Run a query to load segments.")
@@ -854,6 +871,29 @@
       );
     }
 
+    function useCountUp(target, duration) {
+      const dur = duration ?? Math.min(600, Math.max(150, Math.abs(target) / 2000));
+      const [val, setVal] = useState(target);
+      const raf = useRef(null);
+      const prev = useRef(target);
+      useEffect(() => {
+        if (prev.current === target) return;
+        const from = prev.current; const to = target;
+        prev.current = target;
+        const t0 = performance.now();
+        const tick = (now) => {
+          const p = Math.min((now - t0) / dur, 1);
+          const e = 1 - Math.pow(1 - p, 3);
+          setVal(Math.round(from + (to - from) * e));
+          if (p < 1) raf.current = requestAnimationFrame(tick);
+        };
+        if (raf.current) cancelAnimationFrame(raf.current);
+        raf.current = requestAnimationFrame(tick);
+        return () => { if (raf.current) cancelAnimationFrame(raf.current); };
+      }, [target, dur]);
+      return val;
+    }
+
     function timeAgo(ts) {
       const s = Math.max(1, Math.round((Date.now() - ts) / 1000));
       if (s < 60) return `${s}s ago`;
@@ -866,14 +906,12 @@
     /*  App                                                                       */
     /* -------------------------------------------------------------------------- */
     function App() {
-      // Pre-fill from/to to match the bench data window (2026-04-24 00:00→06:00Z)
-      const initialRange = fromPreset(6*3600_000);
       const [qstate, setQstate] = useState({
         filter: "country:FR AND device:mobile AND NOT status:500",
         agg: "cardinality",
-        preset: "6h",
-        from: initialRange.from,
-        to: initialRange.to,
+        preset: "all",
+        from: null,
+        to: null,
         partitions: [],
         topN: 10,
       });
@@ -886,6 +924,8 @@
       const [loadingQuery, setLoadingQuery] = useState(false);
       const [loadingFacets, setLoadingFacets] = useState(false);
       const [loadingSegments, setLoadingSegments] = useState(false);
+      const [refreshing, setRefreshing] = useState(false);
+      const hasResult = useRef(false);
       const [history, setHistory] = useState([]);
       const [historyOpen, setHistoryOpen] = useState(false);
       const [compareWith, setCompareWith] = useState(null);
@@ -894,9 +934,19 @@
       const aggObj = AGGS.find(a => a.id === qstate.agg) || AGGS[0];
 
       const runQuery = useCallback(async () => {
-        setLoadingQuery(true);
-        setLoadingFacets(true);
-        setLoadingSegments(true);
+        const isRefresh = hasResult.current;
+        if (!isRefresh) {
+          setLoadingQuery(true); setLoadingFacets(true); setLoadingSegments(true);
+        } else {
+          setRefreshing(true);
+          // Filter change → clear facets immediately so stale data from a different
+          // filter doesn't mislead. Agg/preset/partition changes keep stale (less confusing).
+          const prevFilter = prevQstate.current?.filter;
+          if (prevFilter !== undefined && prevFilter !== qstate.filter) {
+            setFacets(null);
+            setSegments(null);
+          }
+        }
         setQueryError(null);
         setFacetsError(null);
 
@@ -916,6 +966,7 @@
         ]);
 
         if (qRes.status === "fulfilled") {
+          hasResult.current = true;
           setResult(qRes.value);
           setHistory(h => [{
             id: String(Date.now()).slice(-6),
@@ -930,6 +981,7 @@
           setQueryError(qRes.reason?.message || "Query failed");
         }
         setLoadingQuery(false);
+        setRefreshing(false);
 
         if (fRes.status === "fulfilled") setFacets(fRes.value);
         else setFacetsError(fRes.reason?.message || "Facets failed");
@@ -938,6 +990,10 @@
         if (sRes.status === "fulfilled") setSegments(sRes.value);
         setLoadingSegments(false);
       }, [qstate, aggObj]);
+
+      // Always-fresh runQuery ref (avoids stale closure in effects/callbacks)
+      const runQueryRef = useRef(null);
+      runQueryRef.current = runQuery;
 
       // Health check every 15s
       useEffect(() => {
@@ -948,7 +1004,26 @@
       }, []);
 
       // Auto-run once on mount
-      useEffect(() => { runQuery(); }, []); // eslint-disable-line
+      useEffect(() => { runQueryRef.current(); }, []);
+
+      // Auto-run on any qstate change:
+      //   filter → debounce 500ms (typing); everything else → immediate
+      const prevQstate = useRef(null);
+      useEffect(() => {
+        const prev = prevQstate.current;
+        prevQstate.current = qstate;
+        if (!prev) return; // skip mount (handled above)
+        const filterOnly = prev.filter !== qstate.filter &&
+          prev.agg === qstate.agg && prev.preset === qstate.preset &&
+          prev.from === qstate.from && prev.to === qstate.to &&
+          JSON.stringify(prev.partitions) === JSON.stringify(qstate.partitions) &&
+          prev.topN === qstate.topN;
+        if (filterOnly) {
+          const t = setTimeout(() => runQueryRef.current(), 500);
+          return () => clearTimeout(t);
+        }
+        runQueryRef.current();
+      }, [qstate]);
 
       // ⌘K → history
       useEffect(() => {
@@ -971,19 +1046,39 @@
       };
 
       const addFilter = (dim, value) => {
-        const expr = `${dim}:${value}`;
         setQstate(s => {
           const existing = s.filter.trim();
-          if (!existing) return { ...s, filter: expr };
-          if (existing.includes(expr)) return s;
-          return { ...s, filter: `${existing} AND ${expr}` };
+          // Remove any clause for this dim (positive or NOT), then append new one
+          const dimRe = new RegExp(
+            `(?:(?:AND|OR)\\s+)?(?:NOT\\s+)?\\b${dim}:[A-Za-z0-9_,./:-]+(?=\\s+(?:AND|OR)|$)`,
+            'gi'
+          );
+          const cleaned = existing
+            .replace(dimRe, '')
+            .replace(/^\s*(AND|OR)\s+/i, '')
+            .replace(/\s+(AND|OR)\s*$/i, '')
+            .replace(/\s{2,}/g, ' ')
+            .trim();
+          const clause = `${dim}:${value}`;
+          return { ...s, filter: cleaned ? `${cleaned} AND ${clause}` : clause };
         });
       };
+
+      const activeFilters = useMemo(() => {
+        const out = {};
+        if (!qstate.filter) return out;
+        const re = /(?:^|(?:AND|OR)\s+)(?!NOT\s)([A-Za-z_][A-Za-z0-9_]*):([A-Za-z0-9_,./:-]+)/gi;
+        let m;
+        while ((m = re.exec(qstate.filter)) !== null) {
+          out[m[1]] = new Set(m[2].split(','));
+        }
+        return out;
+      }, [qstate.filter]);
 
       const recall = (item) => {
         setQstate(item.state);
         setHistoryOpen(false);
-        setTimeout(runQuery, 50);
+        setTimeout(() => runQueryRef.current(), 50);
       };
 
       const compareItem = compareWith ? history.find(h => h.id === compareWith) : null;
@@ -991,10 +1086,10 @@
       return h("div", { className:"min-h-screen" },
         h(Header, { connected, onOpenHistory: () => setHistoryOpen(true) }),
         h("main", { className:"max-w-[1440px] mx-auto px-6 py-6 space-y-5" },
-          h(QueryBar, { state: qstate, setState: setQstate, onRun: runQuery, running: loadingQuery }),
-          h(ResultCard, { result, error: queryError, loading: loadingQuery, agg: qstate.agg, filter: qstate.filter, compareItem }),
-          h(FacetsPanel, { facets, error: facetsError, loading: loadingFacets, topN: qstate.topN, onAddFilter: addFilter }),
-          h(SegmentsPanel, { segments, loading: loadingSegments, onRefresh: refreshSegments })
+          h(QueryBar, { state: qstate, setState: setQstate, onRun: runQuery, running: loadingQuery || refreshing }),
+          h(ResultCard, { result, error: queryError, loading: loadingQuery, refreshing, agg: qstate.agg, filter: qstate.filter, compareItem }),
+          h(FacetsPanel, { facets, error: facetsError, loading: loadingFacets, refreshing, topN: qstate.topN, onAddFilter: addFilter, activeFilters }),
+          h(SegmentsPanel, { segments, loading: loadingSegments, refreshing, onRefresh: refreshSegments })
         ),
         h(HistoryDrawer, {
           open: historyOpen, onClose: () => setHistoryOpen(false),
