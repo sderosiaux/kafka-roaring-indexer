@@ -103,6 +103,127 @@ A few choices that aren't obvious:
 
 Deliberately skipped in v1, flagged in the task list: ART backing for the dict (prefix filters + radix compression on clustered keys), `Int2ObjectOpenHashMap` for the value-id map (quick RAM win), Z-order for multi-range numeric dims.
 
+## Storage layout: partitions, segments, manifest
+
+One Kafka topic produces one directory tree on disk. The consumer consumes every partition, and the indexer carves the data into **one segment per `(partition, time bucket)`** — the natural unit at which Kafka offsets are linear and at which a query plan wants to fan out.
+
+```mermaid
+flowchart LR
+  subgraph K["Kafka topic events"]
+    P0[partition 0]
+    P1[partition 1]
+    P2[partition 2]
+    PN[partition N]
+  end
+
+  subgraph I["IndexerConsumer — single process"]
+    L[poll loop]
+    S["store.segmentFor(partition, ts)"]
+  end
+
+  subgraph D["/var/lib/kri/events/"]
+    M[manifest.json<br/>catalog of every segment]
+    subgraph SEG["segments/"]
+      S1["seg p00000 10h..11h"]
+      S2["seg p00001 10h..11h"]
+      S3["seg p00000 11h..12h"]
+      S4["..."]
+    end
+  end
+
+  P0 --> L
+  P1 --> L
+  P2 --> L
+  PN --> L
+  L --> S
+  S -. freeze + fsync + manifest upsert .-> S1
+  S -.-> S2
+  S -.-> S3
+  SEG --- M
+```
+
+Rollover is the moment that matters: `seg.freeze()` runs `runOptimize` on every bitmap, `SegmentIO.write()` fsyncs the segment tree, `manifest.upsert()` replaces the manifest atomically via tmp-file-rename, and **only then** `commitSync` advances the Kafka offset for that partition. Crash between add and fsync = replay, and `bitmap.add(memberId)` is idempotent, so no double count.
+
+### The grid: one segment per (partition, time bucket)
+
+```
+                       time buckets (1h each)
+                    ┌─────┬─────┬─────┬─────┬─────┬─────┐
+                    │ 10h │ 11h │ 12h │ 13h │ 14h │ 15h │
+           ┌────────┼─────┼─────┼─────┼─────┼─────┼─────┤
+           │   p0   │ s03 │ s16 │ s22 │ s34 │ s40 │ s52 │
+  Kafka    │   p1   │ s09 │ s12 │ s25 │ s31 │ s45 │ s59 │
+  partition│   p2   │ s06 │ s18 │ s20 │ s33 │ s41 │ s57 │
+  of topic │  ...   │     │     │     │     │     │     │
+           │   p9   │ s08 │ s15 │ s28 │ s37 │ s49 │ s50 │
+           └────────┴─────┴─────┴─────┴─────┴─────┴─────┘
+                            │                 │
+                            └── query range ──┘
+                      fan-out = 10 partitions × 2 buckets = 20 segments
+                      FastAggregation.or(bm_0 … bm_19) → unified result
+```
+
+Each cell is **independent**: its own dict, its own bitmaps, its own offset range on one Kafka partition. A query over a time range fetches every cell intersecting that range across every partition and unions the per-segment bitmaps. Cross-partition distinct-count is correct as long as the member id is stable across partitions — which is the case for `raw_uint32` and `hash64`, and which is why `dict` member encoding is called out as a cross-segment limitation in the evaluator.
+
+### A segment on disk
+
+```
+segments/seg_00000000000000000003_p00000_1777024800000_1777028400000/
+│                                │└── partition (5 digits, zero-padded)
+│                                └──── segment id (20 digits, zero-padded)
+│
+├── meta.json              {id, partition, startMs, endMs, recordCount,
+│                           offsets: {0: {first, last}},
+│                           schemaVersion, dimNames, metricNames}
+│
+├── dims/                  one .rbi per declared dimension
+│   ├── country.rbi        [N:int] then N × ([valueId:int][size:int][roaring bytes])
+│   ├── device.rbi            "FR" → valueId 0 → RoaringBitmap of member ids
+│   ├── status.rbi            "DE" → valueId 1 → RoaringBitmap of member ids
+│   └── path.rbi              ...
+│
+├── dicts/                 value ↔ id lookup for dict-encoded dims
+│   ├── country.dict       "0\tFR\n1\tDE\n..."
+│   └── device.dict
+│
+└── metrics/
+    ├── distinctUsers.ull   [sliceCount:int] then N × (slice tuple + ULL bytes)
+    ├── requestCount.count  [8-byte long]
+    └── totalLatencyMs.sum  [8-byte long]
+```
+
+The `.rbi` wire format is portable Roaring, readable from any language with a Roaring port — the file is a list of `(valueId, bitmap)` pairs length-prefixed, nothing bespoke.
+
+### The manifest
+
+A single `manifest.json` at the root is the source of truth for *which segments exist*. It's updated atomically on every rollover via tmp-file + `ATOMIC_MOVE`.
+
+```json
+{
+  "version": 1,
+  "entries": [
+    {
+      "id": 3,
+      "partition": 0,
+      "startMs": 1777024800000,
+      "endMs":   1777028400000,
+      "recordCount": 333761,
+      "dir": "seg_...p00000_1777024800000_1777028400000",
+      "offsets":        { "0": { "first": 0, "last": 333760 } },
+      "dimValueCounts": { "country": 10, "device": 3, "status": 9, "path": 10000 }
+    },
+    { "id": 9, "partition": 1, "startMs": 1777024800000, ... },
+    ...
+  ]
+}
+```
+
+Why it exists: a query with `from=10h&to=15h` must not scan `segments/`. It filters `manifest.entries` on `(startMs < to) AND (endMs > from)` — plus an optional `partitions` subset — to get the list of directories to touch. Directory scan is O(list) and, on object storage, a paid operation per segment. Manifest lookup is O(1) once cached.
+
+Startup path: `loadAll` reads the manifest if present and loads only the entries it lists; if the manifest is missing (legacy directory or corrupted write), it falls back to a directory scan and rebuilds the manifest as a side effect. So the manifest is advisory for correctness and authoritative for planning.
+
+At SaaS scale, this is the object you hold in RAM per tenant. A topic with 10 partitions × 30d × 1h buckets produces ~7200 entries, roughly 1–2 MB of JSON, trivial to index in memory by `(partition, startMs)` for range pruning.
+
 ## The shape of a query
 
 ```
