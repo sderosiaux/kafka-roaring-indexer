@@ -4,6 +4,7 @@ import io.conduktor.kri.config.IndexerConfig
 import io.conduktor.kri.config.SchemaRegistry
 import io.conduktor.kri.index.Segment
 import io.conduktor.kri.index.SegmentStore
+import io.conduktor.kri.persistence.AsyncSegmentWriter
 import io.conduktor.kri.persistence.SegmentIO
 import org.apache.kafka.clients.consumer.ConsumerConfig
 import org.apache.kafka.clients.consumer.KafkaConsumer
@@ -14,6 +15,7 @@ import org.slf4j.LoggerFactory
 import java.time.Duration
 import java.time.Instant
 import java.util.Properties
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 class IndexerConsumer(
@@ -27,6 +29,7 @@ class IndexerConsumer(
     private val running = AtomicBoolean(false)
     private var consumer: KafkaConsumer<ByteArray, Any?>? = null
     private var thread: Thread? = null
+    private val asyncWriter = segmentIO?.let { AsyncSegmentWriter(it) }
 
     fun start() {
         if (!running.compareAndSet(false, true)) return
@@ -46,6 +49,7 @@ class IndexerConsumer(
         if (!running.compareAndSet(true, false)) return
         consumer?.wakeup()
         thread?.join(5000)
+        asyncWriter?.shutdown()
         log.info("Consumer stopped")
     }
 
@@ -101,7 +105,10 @@ class IndexerConsumer(
         pending: MutableMap<TopicPartition, OffsetAndMetadata>,
     ) {
         // M10 invariant: persist first, THEN commit offsets for partitions covered.
-        segmentIO?.write(seg)
+        // Persist runs on a dedicated thread to avoid blocking the poll loop (max.poll.interval.ms),
+        // but we still await completion before committing to preserve crash safety.
+        val future = asyncWriter?.submit(seg)
+        future?.get(60, TimeUnit.SECONDS)
         val covered = seg.offsets.keys.map { p -> TopicPartition(cfg.source.topic, p) }
         val commit = pending.filter { it.key in covered }
         if (commit.isNotEmpty()) {

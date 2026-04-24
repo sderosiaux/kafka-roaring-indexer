@@ -329,6 +329,25 @@ class SegmentIO(
         }
     }
 
+    fun gcOldSegments(
+        retentionMs: Long,
+        store: io.conduktor.kri.index.SegmentStore,
+    ) {
+        val cutoffMs = System.currentTimeMillis() - retentionMs
+        val current = manifest.load()
+        val (expired, keep) = current.partition { it.endMs < cutoffMs }
+        if (expired.isEmpty()) return
+        expired.forEach { e ->
+            val dir = segmentsDir.resolve(e.dir)
+            runCatching { deleteRecursively(dir) }
+                .onSuccess { log.info("GC: deleted segment dir {}", dir) }
+                .onFailure { log.warn("GC: failed to delete {}: {}", dir, it.message) }
+            store.unregisterFrozen(e.id)
+        }
+        manifest.save(keep)
+        log.info("GC: removed {} expired segment(s), {} remain", expired.size, keep.size)
+    }
+
     private fun deleteRecursively(p: Path) {
         if (!Files.exists(p)) return
         Files.walk(p).use { s ->

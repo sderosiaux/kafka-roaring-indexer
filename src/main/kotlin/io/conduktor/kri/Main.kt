@@ -1,6 +1,7 @@
 package io.conduktor.kri
 
 import io.conduktor.kri.config.ConfigLoader
+import io.conduktor.kri.config.parseDuration
 import io.conduktor.kri.index.SegmentStore
 import io.conduktor.kri.ingest.IndexerConsumer
 import io.conduktor.kri.persistence.SegmentIO
@@ -9,6 +10,8 @@ import io.conduktor.kri.query.HttpServer
 import io.conduktor.kri.schema.SchemaRegistryProbe
 import org.slf4j.LoggerFactory
 import java.nio.file.Path
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.system.exitProcess
 
@@ -48,12 +51,30 @@ fun main(args: Array<String>) {
     val http = HttpServer(cfg, store, evaluator).also { it.start() }
     val consumer = IndexerConsumer(cfg, store, segmentIO).also { it.start() }
 
+    val gcScheduler =
+        cfg.segmentation.retention?.let { retentionStr ->
+            val retentionMs = parseDuration(retentionStr).toMillis()
+            Executors
+                .newSingleThreadScheduledExecutor { r ->
+                    Thread(r, "kri-gc").also { it.isDaemon = true }
+                }.also { sched ->
+                    sched.scheduleAtFixedRate(
+                        { segmentIO?.gcOldSegments(retentionMs, store) },
+                        1,
+                        60,
+                        TimeUnit.MINUTES,
+                    )
+                    log.info("Retention GC scheduled every 60m, cutoff={}", retentionStr)
+                }
+        }
+
     Runtime.getRuntime().addShutdownHook(
         Thread {
             log.info("Shutdown initiated")
             runCatching { consumer.stop() }
             runCatching { http.stop() }
             runCatching { evaluator.shutdown() }
+            gcScheduler?.shutdown()
         },
     )
 

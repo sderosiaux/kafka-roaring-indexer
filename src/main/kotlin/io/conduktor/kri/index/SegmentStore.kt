@@ -105,5 +105,9 @@ class SegmentStore(
         if (seg.id >= nextId.get()) nextId.set(seg.id + 1)
     }
 
+    fun unregisterFrozen(id: Long) {
+        frozen.remove(id)
+    }
+
     fun size(): Int = open.size + frozen.size
 }
