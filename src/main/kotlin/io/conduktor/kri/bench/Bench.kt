@@ -4,6 +4,7 @@ import io.conduktor.kri.config.ConfigLoader
 import io.conduktor.kri.index.SegmentStore
 import io.conduktor.kri.query.Evaluator
 import io.conduktor.kri.query.FilterParser
+import io.conduktor.kri.query.HttpServer
 import io.conduktor.kri.query.QueryRequest
 import java.time.Instant
 import java.util.SplittableRandom
@@ -25,6 +26,7 @@ fun main(args: Array<String>) {
     val nUsers = opts["users"]?.toInt() ?: 1_000_000
     val nPaths = opts["paths"]?.toInt() ?: 10_000
     val nPartitions = opts["partitions"]?.toInt() ?: 1
+    val serve = "serve" in opts || args.contains("--serve")
 
     println("bench: events=$nEvents buckets=$nBuckets partitions=$nPartitions users=$nUsers paths=$nPaths")
 
@@ -169,7 +171,21 @@ fun main(args: Array<String>) {
             .format(scanAt100k, scanAt1m),
     )
 
-    evaluator.shutdown()
+    if (serve) {
+        println()
+        println("serve: starting HTTP on http://localhost:8080  (frontend at http://localhost:8080/)")
+        val http = HttpServer(cfg, store, evaluator)
+        http.start()
+        Runtime.getRuntime().addShutdownHook(
+            Thread {
+                http.stop()
+                evaluator.shutdown()
+            },
+        )
+        Thread.currentThread().join()
+    } else {
+        evaluator.shutdown()
+    }
 }
 
 private data class Q(
