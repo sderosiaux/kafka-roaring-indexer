@@ -18,11 +18,14 @@ import org.junit.jupiter.api.Assumptions
 import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
+import org.slf4j.LoggerFactory
+import org.testcontainers.containers.output.Slf4jLogConsumer
 import org.testcontainers.kafka.KafkaContainer
 import org.testcontainers.utility.DockerImageName
 import java.nio.file.Path
 import java.time.Instant
 import java.util.Properties
+import java.time.Duration as JDuration
 
 class KafkaIntegrationTest {
     companion object {
@@ -32,12 +35,16 @@ class KafkaIntegrationTest {
         @JvmStatic
         @BeforeAll
         fun startKafka() {
-            val container = KafkaContainer(DockerImageName.parse("apache/kafka:3.9.0"))
+            val logger = LoggerFactory.getLogger("KafkaContainer")
+            val container =
+                KafkaContainer(DockerImageName.parse("apache/kafka:3.8.0"))
+                    .withStartupTimeout(JDuration.ofSeconds(180))
+                    .withLogConsumer(Slf4jLogConsumer(logger))
             try {
                 container.start()
                 kafka = container
             } catch (e: Throwable) {
-                Assumptions.abort<Unit>("Docker unavailable — skipping integration test: ${e.message}")
+                Assumptions.abort<Unit>("Docker unavailable or Kafka startup failed — skipping: ${e.message}")
             }
         }
 
