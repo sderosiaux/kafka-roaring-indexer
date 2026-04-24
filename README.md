@@ -83,17 +83,16 @@ A few choices that aren't obvious:
   ```mermaid
   sequenceDiagram
     participant C as Consumer
-    participant S as Segment (RAM)
+    participant S as Segment RAM
     participant D as Disk
     participant K as Kafka
-
-    C->>S: add(partition, offset, record)
-    Note over S: bitmap.add(memberId)<br/>ULL.add(hash)
+    C->>S: add partition offset record
+    Note over S: bitmap.add memberId<br/>ULL.add hash
     S->>S: rollover trigger
-    S->>D: serialize + fsync (.rbi / .ull / .count)
+    S->>D: serialize + fsync rbi ull count
     D-->>S: durable
-    S->>K: commitSync(offsets)
-    Note over C,K: crash before commit →<br/>replay consumes from last committed<br/>offset; add() is idempotent ⇒ safe
+    S->>K: commitSync offsets
+    Note over C,K: crash before commit:<br/>replay from last committed offset<br/>add is idempotent so safe
   ```
 
 - **Per-dim encoder chosen at config time.** Dict when you'll filter on exact values. Raw uint32 when the field already fits. Hash32/64 when cardinality is huge and you only need equality, not ground truth (with the collision caveat spelled out in the config comment).
