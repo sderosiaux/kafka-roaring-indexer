@@ -1,9 +1,13 @@
 package io.conduktor.kri.query
 
 import io.conduktor.kri.config.IndexerConfig
+import io.conduktor.kri.index.DictEncoder
+import io.conduktor.kri.index.RawUInt32Encoder
 import io.conduktor.kri.index.SegmentStore
 import io.javalin.Javalin
 import io.javalin.http.Context
+import io.javalin.http.staticfiles.Location
+import org.roaringbitmap.RoaringBitmap
 import org.slf4j.LoggerFactory
 import java.time.Instant
 import java.time.format.DateTimeParseException
@@ -23,10 +27,16 @@ class HttpServer(
 
         app =
             Javalin
-                .create { c -> c.showJavalinBanner = false }
-                .get("/health") { ctx -> ctx.result("ok") }
+                .create { c ->
+                    c.showJavalinBanner = false
+                    c.staticFiles.add("/public", Location.CLASSPATH)
+                    c.bundledPlugins.enableCors { cors ->
+                        cors.addRule { it.anyHost() }
+                    }
+                }.get("/health") { ctx -> ctx.result("ok") }
                 .get("/segments") { ctx -> ctx.json(segmentsInfo()) }
                 .get("/query") { ctx -> handleQuery(ctx) }
+                .get("/facets") { ctx -> handleFacets(ctx) }
                 .get("/cardinality") { ctx -> handleCardinalityLegacy(ctx) }
                 .start(host, port)
         log.info("HTTP listening on http://{}:{}", host, port)
@@ -40,6 +50,7 @@ class HttpServer(
         store.allSegments().map { s ->
             mapOf(
                 "id" to s.id,
+                "partition" to s.partition,
                 "tStart" to s.tStart.toString(),
                 "tEnd" to s.tEnd.toString(),
                 "recordCount" to s.recordCount.get(),
@@ -49,13 +60,22 @@ class HttpServer(
             )
         }
 
+    private fun parsePartitions(ctx: Context): Set<Int>? =
+        ctx
+            .queryParam("partitions")
+            ?.split(",")
+            ?.mapNotNull { it.trim().toIntOrNull() }
+            ?.toSet()
+            ?.ifEmpty { null }
+
     private fun handleQuery(ctx: Context) {
         try {
             val from = parseInstant(ctx.queryParam("from")) ?: Instant.EPOCH
             val to = parseInstant(ctx.queryParam("to")) ?: Instant.now().plusSeconds(1)
             val filter = FilterParser.parse(ctx.queryParam("filter"))
             val agg = ctx.queryParam("agg") ?: "count"
-            val segs = store.segmentsOverlapping(from, to)
+            val partitions = parsePartitions(ctx)
+            val segs = store.segmentsOverlapping(from, to, partitions)
             if (segs.size > cfg.query.maxSegmentsPerQuery) {
                 ctx.status(400).json(mapOf("error" to "too many segments: ${segs.size} > ${cfg.query.maxSegmentsPerQuery}"))
                 return
@@ -76,6 +96,60 @@ class HttpServer(
             ctx.status(400).json(mapOf("error" to e.message))
         } catch (e: Exception) {
             log.error("query failed", e)
+            ctx.status(500).json(mapOf("error" to e.message))
+        }
+    }
+
+    private fun handleFacets(ctx: Context) {
+        try {
+            val from = parseInstant(ctx.queryParam("from")) ?: Instant.EPOCH
+            val to = parseInstant(ctx.queryParam("to")) ?: Instant.now().plusSeconds(1)
+            val filter = FilterParser.parse(ctx.queryParam("filter"))
+            val partitions = parsePartitions(ctx)
+            val topN = ctx.queryParam("topN")?.toIntOrNull()?.coerceIn(1, 1000) ?: 20
+            val segs = store.segmentsOverlapping(from, to, partitions)
+
+            // For each dim: sum per-value cardinality across segments (filtered by matched bitmap).
+            val dimNames = cfg.dimensions.map { it.name }
+            val facets = mutableMapOf<String, List<Map<String, Any>>>()
+
+            for (dim in dimNames) {
+                val totals = mutableMapOf<Int, Long>()
+                for (seg in segs) {
+                    val matched = evaluator.evalFilter(seg, filter)
+                    val valueMap = seg.dims[dim] ?: continue
+                    for ((valueId, bm) in valueMap) {
+                        val count = RoaringBitmap.andCardinality(matched, bm).toLong()
+                        if (count > 0) totals.merge(valueId, count, Long::plus)
+                    }
+                }
+                val encoder = segs.firstOrNull()?.dimEncoder(dim)
+                val topValues =
+                    totals.entries
+                        .sortedByDescending { it.value }
+                        .take(topN)
+                        .map { (valueId, count) ->
+                            val label =
+                                when (encoder) {
+                                    is DictEncoder -> encoder.dict().reverse(valueId) ?: valueId.toString()
+                                    is RawUInt32Encoder -> valueId.toLong().and(0xFFFFFFFFL).toString()
+                                    else -> "0x${valueId.toUInt().toString(16)}"
+                                }
+                            mapOf("value" to label, "count" to count)
+                        }
+                facets[dim] = topValues
+            }
+
+            ctx.json(
+                mapOf(
+                    "segments" to segs.size,
+                    "facets" to facets,
+                ),
+            )
+        } catch (e: FilterParseException) {
+            ctx.status(400).json(mapOf("error" to "filter parse: ${e.message}"))
+        } catch (e: Exception) {
+            log.error("facets failed", e)
             ctx.status(500).json(mapOf("error" to e.message))
         }
     }
@@ -109,7 +183,6 @@ class HttpServer(
         return try {
             Instant.parse(s)
         } catch (e: DateTimeParseException) {
-            // Tolerant: fall back to adding Z suffix if partial.
             runCatching { Instant.parse("${s}Z") }.getOrNull()
         }
     }
