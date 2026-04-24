@@ -29,6 +29,8 @@ class Dict(
 
     fun entries(): List<Pair<String, Int>> = map.entries.map { it.key to it.value }.sortedBy { it.second }
 
+    fun reverse(id: Int): String? = map.entries.find { it.value == id }?.key
+
     fun toMap(): Map<String, Int> = map.toMap()
 
     companion object {

@@ -31,6 +31,8 @@ class Segment(
     @Volatile var frozen: Boolean = false
         private set
 
+    @Volatile private var frozenUniverse: RoaringBitmap? = null
+
     /** dimName → (valueId → bitmap(members)). Both levels use ConcurrentHashMap for safe reads during writes. */
     val dims: MutableMap<String, MutableMap<Int, RoaringBitmap>> = ConcurrentHashMap()
 
@@ -132,6 +134,9 @@ class Segment(
         lock.write {
             if (frozen) return
             dims.values.forEach { vm -> vm.values.forEach { it.runOptimize() } }
+            val universe = RoaringBitmap()
+            dims.values.forEach { vm -> vm.values.forEach { universe.or(it) } }
+            frozenUniverse = universe
             frozen = true
         }
     }
@@ -157,11 +162,7 @@ class Segment(
      * before folding so concurrent writes can't mutate mid-scan.
      */
     fun memberUniverse(): RoaringBitmap {
-        if (frozen) {
-            val all = RoaringBitmap()
-            dims.values.forEach { vm -> vm.values.forEach { all.or(it) } }
-            return all
-        }
+        frozenUniverse?.let { return it }
         return lock.read {
             val all = RoaringBitmap()
             dims.values.forEach { vm ->

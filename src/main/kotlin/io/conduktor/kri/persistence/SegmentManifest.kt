@@ -49,11 +49,16 @@ class SegmentManifest(
         val entries: List<Entry> = emptyList(),
     )
 
+    @Volatile private var cache: List<Entry> = emptyList()
+
     @Synchronized
     fun load(): List<Entry> {
+        if (cache.isNotEmpty()) return cache
         if (!Files.exists(file)) return emptyList()
         return try {
-            mapper.readValue<Doc>(Files.readAllBytes(file)).entries
+            val entries = mapper.readValue<Doc>(Files.readAllBytes(file)).entries
+            cache = entries
+            entries
         } catch (e: Exception) {
             log.warn("Manifest unreadable at {}: {}. Ignoring.", file, e.message)
             emptyList()
@@ -63,13 +68,15 @@ class SegmentManifest(
     @Synchronized
     fun save(entries: List<Entry>) {
         Files.createDirectories(root)
-        val doc = Doc(version = 1, entries = entries.sortedWith(compareBy({ it.startMs }, { it.partition }, { it.id })))
+        val sorted = entries.sortedWith(compareBy({ it.startMs }, { it.partition }, { it.id }))
+        val doc = Doc(version = 1, entries = sorted)
         val json = mapper.writeValueAsBytes(doc)
         Files.write(tmp, json)
         java.nio.channels.FileChannel
             .open(tmp, java.nio.file.StandardOpenOption.WRITE)
             .use { it.force(true) }
         Files.move(tmp, file, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+        cache = sorted
     }
 
     @Synchronized
