@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# kafka-roaring-indexer pre-commit: strict lint + unit tests.
+# Install once via: ./gradlew installGitHooks
+
+if ! command -v gradle >/dev/null 2>&1; then
+  echo "pre-commit: gradle not on PATH; skipping" >&2
+  exit 0
+fi
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+staged_kt=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.kts?$' || true)
+if [[ -z "$staged_kt" ]]; then
+  exit 0
+fi
+
+echo "pre-commit: running ktlintCheck"
+gradle --no-daemon --quiet ktlintCheck
+echo "pre-commit: running unit tests (excluding integration)"
+gradle --no-daemon --quiet test \
+  --tests "io.conduktor.kri.config.*" \
+  --tests "io.conduktor.kri.query.FilterParserTest" \
+  --tests "io.conduktor.kri.index.*" \
+  --tests "io.conduktor.kri.persistence.*"
+
+echo "pre-commit: OK"

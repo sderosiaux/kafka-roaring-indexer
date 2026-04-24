@@ -1,0 +1,124 @@
+apiVersion: indexer.conduktor.io/v1
+kind: IndexerConfig
+metadata:
+  name: events-analytics-poc
+  description: |
+    Pre-aggregated bitmap index on the `events` topic.
+    Answers: distinct users / filter on country, device, status, path.
+
+source:
+  topic: events
+  bootstrap: kafka-broker:9092
+  consumerGroup: events-indexer-poc
+  startOffset: latest           # earliest | latest | timestamp:2026-04-20T00:00:00Z
+  schemaRegistry:
+    url: http://schema-registry:8081
+    format: avro                # avro | protobuf | json-schema | json
+  parallelism: 1                # POC: single indexer thread
+
+segmentation:
+  strategy: time
+  bucket: 1h
+  alignment: utc
+  retention: 30d
+  maxOpenSegments: 2            # tolerate one bucket of late-arriving records
+
+fields:
+  userId:   { path: "user.id",       type: uint32 }
+  email:    { path: "user.email",    type: string }
+  country:  { path: "geo.country",   type: string }
+  device:   { path: "client.device", type: string }
+  status:   { path: "response.code", type: uint16 }
+  path:     { path: "request.path",  type: string }
+  latency:  { path: "response.ms",   type: uint32 }
+  tsMs:     { path: "timestamp",     type: uint64, unit: ms }
+
+timeField: tsMs                 # falls back to Kafka record timestamp if omitted
+
+member:
+  field: userId
+  encoding: raw_uint32
+  # If member were a string (e.g. email), use encoding=dict and configure:
+  # dict:
+  #   persist: true
+  #   snapshotEvery: 60s
+  #   maxSize: 100_000_000
+  #   onOverflow: reject        # reject | overflow
+
+dimensions:
+
+  - name: country
+    field: country
+    encoding: dict
+    maxCardinality: 300
+    onOverflow: reject
+
+  - name: device
+    field: device
+    encoding: dict
+    maxCardinality: 50
+
+  - name: status
+    field: status
+    encoding: raw_uint32
+
+  - name: latencyBucket
+    field: latency
+    encoding: raw_uint32
+    bucket:
+      type: exponential         # linear | exponential | explicit
+      base: 2
+      min: 1
+      max: 65536
+
+  - name: pathHashed
+    field: path
+    encoding: hash32            # WARN: hash collisions for cardinality > ~65k.
+                                #       Fine for filtering "path=X", NOT for count-distinct.
+    hashAlgo: murmur3
+    maxCardinality: 10000000    # safety cap
+
+metrics:
+
+  - name: distinctUsers
+    type: ull                   # ull (default) | hll | cpc | count | sum
+    field: userId
+    precision: 12               # 2^12 registers = 4 KB per sketch; ~0.8% stderr
+    # sliceBy omitted → one sketch for the whole segment
+
+  - name: distinctPaths
+    type: ull
+    field: path
+    precision: 14               # 16 KB per sketch; ~0.4% stderr
+    sliceBy: [country, device]  # 300 × 50 = 15k sketches per segment = ~240 MB/segment.
+                                # Lower precision or drop sliceBy if that's too much.
+
+  - name: requestCount
+    type: count                 # scalar counter, NOT replay-safe
+
+  - name: totalLatencyMs
+    type: sum
+    field: latency
+
+storage:
+  path: /var/lib/kafka-roaring-indexer/events
+  format: portable              # portable Roaring + length-prefixed dict
+  compress: zstd                # zstd | none
+  mmap: true
+  flushOnRoll: true             # fsync before Kafka offset commit
+
+query:
+  http:
+    bind: 0.0.0.0:8080
+    auth: none                  # none | bearer | mtls
+  maxSegmentsPerQuery: 720      # 720 × 1h = 30d hard cap
+  cachePlans: true
+
+observability:
+  metrics:
+    prometheus:
+      bind: 0.0.0.0:9090
+  log:
+    level: info
+  sample:
+    rejectedRecords: 0.01       # log 1% of dropped records

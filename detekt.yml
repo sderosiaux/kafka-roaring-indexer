@@ -1,0 +1,54 @@
+build:
+  maxIssues: 0
+  weights:
+    complexity: 2
+    LongParameterList: 1
+
+complexity:
+  active: true
+  ComplexMethod:
+    threshold: 18
+  LongMethod:
+    threshold: 80
+  LongParameterList:
+    functionThreshold: 8
+    constructorThreshold: 10
+  TooManyFunctions:
+    thresholdInFiles: 30
+    thresholdInClasses: 30
+
+style:
+  active: true
+  MagicNumber:
+    active: false
+  ReturnCount:
+    max: 6
+  MaxLineLength:
+    maxLineLength: 140
+  WildcardImport:
+    active: true
+  UnusedPrivateMember:
+    active: true
+
+potential-bugs:
+  active: true
+  UnreachableCode:
+    active: true
+  UnsafeCallOnNullableType:
+    active: true
+
+naming:
+  active: true
+  FunctionNaming:
+    functionPattern: '[a-zA-Z][a-zA-Z0-9]*'
+  VariableNaming:
+    variablePattern: '[a-z][A-Za-z0-9]*'
+
+exceptions:
+  active: true
+  TooGenericExceptionCaught:
+    active: false
+  SwallowedException:
+    active: false
+  InstanceOfCheckForException:
+    active: false

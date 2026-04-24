@@ -1,0 +1,205 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://conduktor.io/schemas/indexer.v1.json",
+  "title": "IndexerConfig",
+  "type": "object",
+  "required": ["apiVersion", "kind", "metadata", "source", "segmentation", "fields", "member", "dimensions", "storage"],
+  "additionalProperties": false,
+  "properties": {
+    "apiVersion": { "const": "indexer.conduktor.io/v1" },
+    "kind":       { "const": "IndexerConfig" },
+
+    "metadata": {
+      "type": "object",
+      "required": ["name"],
+      "properties": {
+        "name":        { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{2,62}$" },
+        "description": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+
+    "source": {
+      "type": "object",
+      "required": ["topic", "bootstrap", "consumerGroup"],
+      "properties": {
+        "topic":          { "type": "string", "minLength": 1 },
+        "bootstrap":      { "type": "string", "minLength": 1 },
+        "consumerGroup":  { "type": "string", "minLength": 1 },
+        "startOffset":    {
+          "oneOf": [
+            { "enum": ["earliest", "latest"] },
+            { "type": "string", "pattern": "^timestamp:" }
+          ]
+        },
+        "schemaRegistry": {
+          "type": "object",
+          "required": ["url", "format"],
+          "properties": {
+            "url":    { "type": "string", "format": "uri" },
+            "format": { "enum": ["avro", "protobuf", "json-schema", "json"] }
+          },
+          "additionalProperties": false
+        },
+        "parallelism":    { "type": "integer", "minimum": 1, "maximum": 64, "default": 1 }
+      },
+      "additionalProperties": false
+    },
+
+    "segmentation": {
+      "type": "object",
+      "required": ["strategy", "bucket"],
+      "properties": {
+        "strategy":         { "enum": ["time", "record_count", "hybrid"] },
+        "bucket":           { "type": "string", "pattern": "^[0-9]+(ms|s|m|h|d)$" },
+        "alignment":        { "enum": ["utc", "none"], "default": "utc" },
+        "retention":        { "type": "string", "pattern": "^[0-9]+(ms|s|m|h|d)$" },
+        "maxOpenSegments":  { "type": "integer", "minimum": 1, "maximum": 16, "default": 2 }
+      },
+      "additionalProperties": false
+    },
+
+    "fields": {
+      "type": "object",
+      "minProperties": 1,
+      "patternProperties": {
+        "^[a-zA-Z][a-zA-Z0-9_]*$": {
+          "type": "object",
+          "required": ["path", "type"],
+          "properties": {
+            "path": { "type": "string", "minLength": 1 },
+            "type": { "enum": ["string", "bytes", "uint8", "uint16", "uint32", "uint64", "int32", "int64", "float", "double", "bool"] },
+            "unit": { "enum": ["ms", "us", "ns", "s"] }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+
+    "timeField": { "type": "string" },
+
+    "member": {
+      "type": "object",
+      "required": ["field", "encoding"],
+      "properties": {
+        "field":    { "type": "string" },
+        "encoding": { "enum": ["raw_uint32", "dict", "hash64"] },
+        "dict": {
+          "type": "object",
+          "properties": {
+            "persist":        { "type": "boolean", "default": true },
+            "snapshotEvery":  { "type": "string", "pattern": "^[0-9]+(ms|s|m|h)$" },
+            "maxSize":        { "type": "integer", "minimum": 1 },
+            "onOverflow":     { "enum": ["reject", "overflow"], "default": "reject" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+
+    "dimensions": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["name", "field", "encoding"],
+        "properties": {
+          "name":           { "type": "string", "pattern": "^[a-zA-Z][a-zA-Z0-9_]*$" },
+          "field":          { "type": "string" },
+          "encoding":       { "enum": ["dict", "raw_uint32", "hash32", "hash64"] },
+          "hashAlgo":       { "enum": ["murmur3", "xxh3"] },
+          "maxCardinality": { "type": "integer", "minimum": 1 },
+          "onOverflow":     { "enum": ["reject", "overflow", "halt"], "default": "reject" },
+          "bucket": {
+            "type": "object",
+            "required": ["type"],
+            "oneOf": [
+              { "properties": { "type": { "const": "linear" },      "step":       { "type": "number" }, "min": { "type": "number" }, "max": { "type": "number" } } },
+              { "properties": { "type": { "const": "exponential" }, "base":       { "type": "number" }, "min": { "type": "number" }, "max": { "type": "number" } } },
+              { "properties": { "type": { "const": "explicit" },    "boundaries": { "type": "array", "items": { "type": "number" } } } }
+            ]
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+
+    "metrics": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "type"],
+        "properties": {
+          "name":      { "type": "string", "pattern": "^[a-zA-Z][a-zA-Z0-9_]*$" },
+          "type":      { "enum": ["ull", "hll", "cpc", "count", "sum"] },
+          "field":     { "type": "string" },
+          "precision": { "type": "integer", "minimum": 4, "maximum": 20 },
+          "hashSeed":  { "type": "integer" },
+          "sliceBy":   { "type": "array", "items": { "type": "string" } }
+        },
+        "additionalProperties": false
+      }
+    },
+
+    "storage": {
+      "type": "object",
+      "required": ["path"],
+      "properties": {
+        "path":        { "type": "string", "minLength": 1 },
+        "format":      { "enum": ["portable"], "default": "portable" },
+        "compress":    { "enum": ["none", "zstd"], "default": "zstd" },
+        "mmap":        { "type": "boolean", "default": true },
+        "flushOnRoll": { "type": "boolean", "default": true }
+      },
+      "additionalProperties": false
+    },
+
+    "query": {
+      "type": "object",
+      "properties": {
+        "http": {
+          "type": "object",
+          "required": ["bind"],
+          "properties": {
+            "bind": { "type": "string", "pattern": "^[0-9.:a-zA-Z_-]+:[0-9]+$" },
+            "auth": { "enum": ["none", "bearer", "mtls"], "default": "none" }
+          },
+          "additionalProperties": false
+        },
+        "maxSegmentsPerQuery": { "type": "integer", "minimum": 1 },
+        "cachePlans":          { "type": "boolean", "default": true }
+      },
+      "additionalProperties": false
+    },
+
+    "observability": {
+      "type": "object",
+      "properties": {
+        "metrics": {
+          "type": "object",
+          "properties": {
+            "prometheus": {
+              "type": "object",
+              "properties": { "bind": { "type": "string" } },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        },
+        "log": {
+          "type": "object",
+          "properties": { "level": { "enum": ["trace", "debug", "info", "warn", "error"], "default": "info" } },
+          "additionalProperties": false
+        },
+        "sample": {
+          "type": "object",
+          "properties": { "rejectedRecords": { "type": "number", "minimum": 0, "maximum": 1 } },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

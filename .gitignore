@@ -1,0 +1,14 @@
+.DS_Store
+*.log
+/build/
+/out/
+/.idea/
+/.gradle/
+/target/
+/data/
+/bin/
+/var/
+local/
+*.iml
+.env
+.env.local
