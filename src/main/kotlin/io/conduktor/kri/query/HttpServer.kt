@@ -23,6 +23,7 @@ import java.time.Duration
 import java.time.Instant
 import java.time.format.DateTimeParseException
 import java.util.Base64
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.TimeUnit
 
 class HttpServer(
@@ -59,6 +60,7 @@ class HttpServer(
                 .get("/facets") { ctx -> handleFacets(ctx) }
                 .get("/cardinality") { ctx -> handleCardinalityLegacy(ctx) }
                 .get("/internal/query") { ctx -> handleInternalQuery(ctx) }
+                .get("/nodes") { ctx -> handleNodes(ctx) }
                 .start(host, port)
         log.info("HTTP listening on http://{}:{}", host, port)
         if (cfg.query.peers.isNotEmpty()) {
@@ -401,6 +403,64 @@ class HttpServer(
             log.error("facets fanout failed", e)
             ctx.status(500).json(mapOf("error" to e.message))
         }
+    }
+
+    // ── Nodes topology ───────────────────────────────────────────────────────
+
+    private fun handleNodes(ctx: Context) {
+        val selfSegs = store.allSegments()
+        val self =
+            mapOf<String, Any>(
+                "url" to "self",
+                "bind" to cfg.query.http.bind,
+                "online" to true,
+                "segments" to selfSegs.size,
+                "records" to selfSegs.sumOf { it.recordCount.get() },
+            )
+        if (cfg.query.peers.isEmpty()) {
+            ctx.json(listOf(self))
+            return
+        }
+        val futures =
+            cfg.query.peers.map { peer ->
+                httpClient
+                    .sendAsync(
+                        HttpRequest
+                            .newBuilder(URI("$peer/health"))
+                            .timeout(Duration.ofSeconds(2))
+                            .GET()
+                            .build(),
+                        HttpResponse.BodyHandlers.ofString(),
+                    ).thenCompose<Map<String, Any>> { health ->
+                        if (health.statusCode() != 200) {
+                            CompletableFuture.completedFuture(
+                                mapOf("url" to peer, "online" to false, "segments" to 0, "records" to 0L),
+                            )
+                        } else {
+                            httpClient
+                                .sendAsync(
+                                    HttpRequest
+                                        .newBuilder(URI("$peer/segments"))
+                                        .timeout(Duration.ofSeconds(2))
+                                        .GET()
+                                        .build(),
+                                    HttpResponse.BodyHandlers.ofString(),
+                                ).thenApply<Map<String, Any>> { segsResp ->
+                                    @Suppress("UNCHECKED_CAST")
+                                    val list = mapper.readValue(segsResp.body(), List::class.java) as List<Map<String, Any>>
+                                    mapOf(
+                                        "url" to peer,
+                                        "online" to true,
+                                        "segments" to list.size,
+                                        "records" to list.sumOf { (it["recordCount"] as? Number)?.toLong() ?: 0L },
+                                    )
+                                }
+                        }
+                    }.exceptionally { _ ->
+                        mapOf("url" to peer, "online" to false, "segments" to 0, "records" to 0L)
+                    }
+            }
+        ctx.json(listOf(self) + futures.map { it.get(5, TimeUnit.SECONDS) })
     }
 
     // ── Shared helpers ───────────────────────────────────────────────────────

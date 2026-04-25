@@ -196,6 +196,14 @@
       } catch { return false; }
     }
 
+    async function apiNodes() {
+      try {
+        const r = await fetch(API + "/nodes");
+        const data = await r.json();
+        return Array.isArray(data) ? data : [];
+      } catch { return []; }
+    }
+
     /* -------------------------------------------------------------------------- */
     /*  Utilities                                                                 */
     /* -------------------------------------------------------------------------- */
@@ -278,12 +286,25 @@
       dot: (p) => h("svg", { ...p, viewBox:"0 0 8 8", fill:"currentColor" }, h("circle", { cx:4, cy:4, r:3 })),
       caret: (p) => h("svg", { ...p, viewBox:"0 0 16 16", fill:"none" }, h("path", { d:"M4 6l4 4 4-4", stroke:"currentColor", strokeWidth:1.3, strokeLinecap:"round", strokeLinejoin:"round" })),
       bolt: (p) => h("svg", { ...p, viewBox:"0 0 16 16", fill:"none" }, h("path", { d:"M9 1.5 3 9h4l-1 5.5L12 7H8l1-5.5z", fill:"currentColor" })),
+      nodes: (p) => h("svg", { ...p, viewBox:"0 0 16 16", fill:"none" },
+        h("circle", { cx:8, cy:3, r:1.8, fill:"currentColor" }),
+        h("circle", { cx:3, cy:13, r:1.8, fill:"currentColor" }),
+        h("circle", { cx:13, cy:13, r:1.8, fill:"currentColor" }),
+        h("line", { x1:8, y1:4.8, x2:3.8, y2:11.2, stroke:"currentColor", strokeWidth:1.3, strokeLinecap:"round" }),
+        h("line", { x1:8, y1:4.8, x2:12.2, y2:11.2, stroke:"currentColor", strokeWidth:1.3, strokeLinecap:"round" }),
+        h("line", { x1:4.8, y1:13, x2:11.2, y2:13, stroke:"currentColor", strokeWidth:1.3, strokeLinecap:"round" })
+      ),
     };
 
     /* -------------------------------------------------------------------------- */
     /*  Header                                                                    */
     /* -------------------------------------------------------------------------- */
-    function Header({ connected, onOpenHistory }) {
+    function Header({ connected, onOpenHistory, tab, onTabChange }) {
+      const NAV = [
+        { id: "explorer", label: "Explorer" },
+        { id: "segments", label: "Segments" },
+        { id: "nodes",    label: "Nodes" },
+      ];
       return h("header", { className:"flex items-center justify-between px-6 h-[52px] border-b hairline bg-[color:var(--surface)]" },
         h("div", { className:"flex items-center gap-8" },
           h("div", { className:"flex items-center gap-2.5" },
@@ -292,8 +313,12 @@
             h("span", { className:"text-[12px] text-[color:var(--ink-3)] ml-1" }, "bitmap-indexed streams")
           ),
           h("nav", { className:"flex items-center gap-0.5" },
-            ["Explorer","Segments","Schema","Settings"].map((n, i) =>
-              h("a", { key: n, href:"#", className: `px-2.5 py-1 rounded-md text-[13px] ${i===0 ? "bg-[color:var(--surface-3)] text-[color:var(--ink)] font-medium" : "text-[color:var(--ink-3)] hover:text-[color:var(--ink)]"}` }, n)
+            NAV.map(({ id, label }) =>
+              h("a", {
+                key: id, href: "#",
+                onClick: (e) => { e.preventDefault(); onTabChange(id); },
+                className: `px-2.5 py-1 rounded-md text-[13px] ${tab === id ? "bg-[color:var(--surface-3)] text-[color:var(--ink)] font-medium" : "text-[color:var(--ink-3)] hover:text-[color:var(--ink)]"}`
+              }, label)
             )
           )
         ),
@@ -806,6 +831,63 @@
     }
 
     /* -------------------------------------------------------------------------- */
+    /*  Nodes panel                                                               */
+    /* -------------------------------------------------------------------------- */
+    function NodesPanel({ nodes, loading, onRefresh }) {
+      const hasPeers = nodes && nodes.length > 1;
+      const onlineNodes = nodes ? nodes.filter(n => n.online) : [];
+      const totalSegs = onlineNodes.reduce((s, n) => s + (n.segments || 0), 0);
+      const totalRecs = onlineNodes.reduce((s, n) => s + (n.records || 0), 0);
+      return h("div", { className:"card" },
+        h("div", { className:"px-5 py-3.5 flex items-center justify-between border-b hairline" },
+          h("div", { className:"flex items-center gap-2" },
+            h(Icon.nodes, { width:14, height:14, style:{ color:"var(--ink-2)" } }),
+            h("span", { className:"text-[11px] font-medium uppercase tracking-wider text-[color:var(--ink-3)]" }, "Nodes"),
+            nodes && h("span", { className:"chip" }, nodes.length + (nodes.length === 1 ? " node" : " nodes")),
+            nodes && hasPeers && h("span", { className:"chip chip-accent" }, "coordinator")
+          ),
+          h("button", { className:"btn btn-sm", onClick: onRefresh },
+            h(Icon.refresh, { width:12, height:12 }), "Refresh")
+        ),
+        loading && !nodes
+          ? h("div", { className:"p-5" }, h("div", { className:"skeleton h-[120px]" }))
+          : !nodes || nodes.length === 0
+            ? h("div", { className:"p-6 text-[13px] text-[color:var(--ink-3)]" }, "No nodes info available.")
+            : h("div", { className:"p-5 space-y-2" },
+                nodes.map((node, i) => {
+                  const isSelf = node.url === "self";
+                  const role = isSelf ? (hasPeers ? "coordinator" : "standalone") : "data node";
+                  const displayUrl = isSelf ? `${node.bind}  (self)` : node.url;
+                  return h("div", {
+                    key: i,
+                    className:"flex items-center gap-4 py-3 px-4 rounded-lg border hairline bg-[color:var(--surface-2)]"
+                  },
+                    h("span", { className:"relative inline-flex w-2 h-2 shrink-0" },
+                      h("span", { className:"absolute inset-0 rounded-full", style:{ background: node.online ? "var(--ok)" : "var(--err)" } }),
+                      node.online && h("span", { className:"absolute inset-0 rounded-full animate-ping", style:{ background: "var(--ok)", opacity: 0.35 } })
+                    ),
+                    h("span", { className:"mono text-[13px] font-medium flex-1 truncate" }, displayUrl),
+                    h("span", { className:`chip ${role === "coordinator" ? "chip-accent" : ""}`, style:{ flexShrink: 0 } }, role),
+                    h("span", { className:"mono text-[12px] text-[color:var(--ink-2)] tabular-nums w-[90px] text-right shrink-0" },
+                      node.online ? fmtNum(node.segments) + " seg" : h("span", { style:{ color:"var(--err)" } }, "offline")
+                    ),
+                    h("span", { className:"mono text-[13px] font-semibold text-[color:var(--ink)] tabular-nums w-[100px] text-right shrink-0" },
+                      node.online ? fmtNum(node.records) : "—"
+                    )
+                  );
+                }),
+                nodes.length > 1 && h("div", { className:"flex items-center gap-4 py-2.5 px-4 pt-3 mt-1 border-t hairline" },
+                  h("span", { className:"w-2 h-2 shrink-0" }),
+                  h("span", { className:"text-[12.5px] text-[color:var(--ink-3)] flex-1" }, "Total across online nodes"),
+                  h("span", { className:"chip invisible shrink-0" }, "—"),
+                  h("span", { className:"mono text-[12px] text-[color:var(--ink-2)] tabular-nums w-[90px] text-right shrink-0" }, fmtNum(totalSegs) + " seg"),
+                  h("span", { className:"mono text-[13px] font-semibold text-[color:var(--ink)] tabular-nums w-[100px] text-right shrink-0" }, fmtNum(totalRecs))
+                )
+              )
+      );
+    }
+
+    /* -------------------------------------------------------------------------- */
     /*  History drawer                                                            */
     /* -------------------------------------------------------------------------- */
     function HistoryDrawer({ open, onClose, history, onRecall, onCompare, compareWith }) {
@@ -909,6 +991,20 @@
     /*  App                                                                       */
     /* -------------------------------------------------------------------------- */
     function App() {
+      const [tab, setTab] = useState("explorer");
+      const [nodes, setNodes] = useState(null);
+      const [loadingNodes, setLoadingNodes] = useState(false);
+
+      const loadNodes = useCallback(async () => {
+        setLoadingNodes(true);
+        const data = await apiNodes();
+        setNodes(data);
+        setLoadingNodes(false);
+      }, []);
+
+      useEffect(() => { loadNodes(); }, []);
+      useEffect(() => { if (tab === "nodes") loadNodes(); }, [tab]);
+
       const [qstate, setQstate] = useState({
         filter: "country:FR AND device:mobile AND NOT status:500",
         agg: "cardinality",
@@ -1097,12 +1193,18 @@
       const compareItem = compareWith ? history.find(h => h.id === compareWith) : null;
 
       return h("div", { className:"min-h-screen" },
-        h(Header, { connected, onOpenHistory: () => setHistoryOpen(true) }),
+        h(Header, { connected, onOpenHistory: () => setHistoryOpen(true), tab, onTabChange: setTab }),
         h("main", { className:"max-w-[1440px] mx-auto px-6 py-6 space-y-5" },
-          h(QueryBar, { state: qstate, setState: setQstate, onRun: runQuery, running: loadingQuery || refreshing }),
-          h(ResultCard, { result, error: queryError, loading: loadingQuery, refreshing, agg: qstate.agg, filter: qstate.filter, compareItem }),
-          h(FacetsPanel, { facets, error: facetsError, loading: loadingFacets, refreshing, topN: qstate.topN, onAddFilter: addFilter, activeFilters }),
-          h(SegmentsPanel, { segments, loading: loadingSegments, refreshing, onRefresh: refreshSegments })
+          tab === "nodes"
+            ? h(NodesPanel, { nodes, loading: loadingNodes, onRefresh: loadNodes })
+            : tab === "segments"
+            ? h(SegmentsPanel, { segments, loading: loadingSegments, refreshing, onRefresh: refreshSegments })
+            : h(React.Fragment, null,
+                h(QueryBar, { state: qstate, setState: setQstate, onRun: runQuery, running: loadingQuery || refreshing }),
+                h(ResultCard, { result, error: queryError, loading: loadingQuery, refreshing, agg: qstate.agg, filter: qstate.filter, compareItem }),
+                h(FacetsPanel, { facets, error: facetsError, loading: loadingFacets, refreshing, topN: qstate.topN, onAddFilter: addFilter, activeFilters }),
+                h(SegmentsPanel, { segments, loading: loadingSegments, refreshing, onRefresh: refreshSegments })
+              )
         ),
         h(HistoryDrawer, {
           open: historyOpen, onClose: () => setHistoryOpen(false),
