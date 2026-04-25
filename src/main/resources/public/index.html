@@ -931,30 +931,39 @@ function Spinner() {
             : buckets.length === 0
             ? h("div", { className:"p-6 text-center text-[13px] text-[color:var(--ink-3)] italic" }, "No data in this time window.")
             : h("div", { className:"p-5" },
-                h("div", { className:"flex items-end gap-[2px]", style:{ height: 140 } },
+                h("div", { className:"flex items-end gap-[2px] overflow-x-auto", style:{ height: 160 } },
                   visible.map((b, i) => {
-                    const pct = Math.max((b.value / max) * 100, b.value > 0 ? 2 : 0);
+                    const barH = Math.max(Math.round((b.value / max) * 120), b.value > 0 ? 2 : 0);
                     const d = new Date(b.bucket);
                     const hr = d.getUTCHours();
                     const label = bucketSize === "1d"
                       ? d.toISOString().slice(5, 10)
                       : hr === 0 ? d.toISOString().slice(5, 10) : String(hr).padStart(2, "0") + ":00";
-                    const showLabel = buckets.length <= 48 ? true : i % Math.ceil(buckets.length / 48) === 0;
-                    return h("div", { key: b.bucket, className:"flex-1 flex flex-col items-center gap-[3px] group cursor-default", title: `${b.bucket}: ${fmtFull(b.value)}` },
+                    const showLabel = visible.length <= 48 ? true : i % Math.ceil(visible.length / 48) === 0;
+                    return h("div", {
+                      key: b.bucket,
+                      className: "flex-1 flex flex-col items-center cursor-default group",
+                      style: { minWidth: 4 },
+                      title: `${b.bucket}\n${fmtFull(b.value)}`,
+                    },
+                      h("div", { style: { flex: 1 } }),
                       h("div", {
-                        className:"w-full bar-fill rounded-t-[2px] transition-all duration-300",
-                        style:{ height: `${pct}%`, minHeight: b.value > 0 ? 2 : 0 }
+                        className: "w-full bar-fill rounded-t-[2px]",
+                        style: { height: barH, transition: "height 300ms cubic-bezier(.2,.7,.2,1)" },
                       }),
-                      showLabel && h("div", { className:"mono text-[9px] text-[color:var(--ink-4)] whitespace-nowrap" }, label)
+                      h("div", {
+                        className: "mono text-[9px] text-[color:var(--ink-4)] whitespace-nowrap mt-[3px]",
+                        style: { height: 14, overflow: "hidden" },
+                      }, showLabel ? label : "")
                     );
                   })
                 ),
-                h("div", { className:"mt-3 flex items-center justify-between text-[11px] mono text-[color:var(--ink-3)]" },
+                h("div", { className:"mt-1 flex items-center justify-between text-[11px] mono text-[color:var(--ink-3)]" },
                   h("span", null, fmtShortTime(buckets[0]?.bucket || "")),
                   h("span", null, "peak: ", h("span", { className:"font-medium text-[color:var(--ink)]" }, fmtNum(max))),
                   h("span", null, fmtShortTime(buckets[buckets.length - 1]?.bucket || ""))
                 ),
-                buckets.length > 400 && h("div", { className:"mt-1 text-[10px] mono text-[color:var(--ink-4)] text-center" }, `${buckets.length} buckets — showing 1 in ${Math.ceil(buckets.length / 400)}`)
+                buckets.length > 400 && h("div", { className:"mt-1 text-[10px] mono text-[color:var(--ink-4)] text-center" }, `${buckets.length} buckets — 1 in ${Math.ceil(buckets.length / 400)} shown`)
               )
       );
     }
