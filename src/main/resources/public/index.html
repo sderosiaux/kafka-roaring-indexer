@@ -177,6 +177,7 @@
         })
         .map(s => ({
           id: s.id,
+          node: s.node || "self",
           partition: s.partition,
           start: s.tStart,
           end: s.tEnd,
@@ -184,6 +185,19 @@
           status: s.frozen ? "frozen" : "open",
           dims: Object.entries(s.dims || {}).map(([d, c]) => `${d}[${c}]`).join(" "),
         }));
+    }
+
+    async function apiTimeseries({ filter, agg, from, to, bucketSize }, signal) {
+      const p = new URLSearchParams();
+      if (from) p.set("from", from);
+      if (to) p.set("to", to);
+      if (filter && filter.trim()) p.set("filter", filter.trim());
+      p.set("agg", agg.apiAgg || agg.id || agg);
+      p.set("bucketSize", bucketSize || "1h");
+      const r = await fetch(API + "/timeseries?" + p.toString(), { signal });
+      const data = await r.json();
+      if (data.error) throw new Error(data.error);
+      return { buckets: data.buckets || [], partial: !!data.partial };
     }
 
     async function apiHealth() {
@@ -241,7 +255,7 @@
     /* -------------------------------------------------------------------------- */
     function tokenize(expr) {
       const out = [];
-      const re = /(\bAND\b|\bOR\b|\bNOT\b)|([A-Za-z_][A-Za-z0-9_]*)(:)("(?:[^"\\]|\\.)*"|[A-Za-z0-9_\-\*\.]+)|([()])|(\s+)/g;
+      const re = /(\bAND\b|\bOR\b|\bNOT\b)|([A-Za-z_][A-Za-z0-9_]*)(:)((?:>=?|<=?|\[)[^\s),]+|"(?:[^"\\]|\\.)*"|[A-Za-z0-9_\-\*\.]+(?:,[A-Za-z0-9_\-\*\.]+)*)|([()])|(\s+)/g;
       let m; let last = 0;
       while ((m = re.exec(expr)) !== null) {
         if (m.index > last) out.push({ type: "text", v: expr.slice(last, m.index) });
@@ -339,7 +353,7 @@
     /* -------------------------------------------------------------------------- */
     /*  Query bar                                                                 */
     /* -------------------------------------------------------------------------- */
-    function QueryBar({ state, setState, onRun, running }) {
+    function QueryBar({ state, setState, onRun, running, autoRefresh, refreshInterval, onAutoRefreshChange, onIntervalChange, countdown }) {
       const { filter, agg, preset, from, to, topN } = state;
       const [showLegend, setShowLegend] = useState(false);
       const update = (patch) => setState(s => ({ ...s, ...patch }));
@@ -409,7 +423,9 @@
                   ["Negation",   "NOT status:500"],
                   ["Grouping",   "(country:FR OR country:DE) AND device:mobile"],
                   ["Multi-val",  "country:FR,DE,US"],
-                  ["Combined",   "device:mobile AND NOT status:500,502,503"],
+                  ["Range gt",   "userId:>1000"],
+                  ["Range bet",  "userId:[100,500]"],
+                  ["Combined",   "device:mobile AND userId:>500"],
                 ].map(([k, v], i) => h("div", { key: i, className:"flex items-center gap-3" },
                   h("span", { className:"text-[color:var(--ink-3)] w-20 shrink-0" }, k),
                   h("code", { className:"mono text-[12px] px-1.5 py-0.5 rounded bg-[color:var(--surface)] border hairline text-[color:var(--ink)]" },
@@ -436,6 +452,18 @@
               [5, 10, 20, 50].map(n => h("button", { key: n, "data-active": topN === n, onClick: () => update({ topN: n }) }, String(n)))
             ),
             "values per facet"
+          ),
+          h("div", { className:"flex items-center gap-2 ml-auto" },
+            h("button", {
+              className: `btn btn-sm ${autoRefresh ? "btn-primary" : "btn-ghost"}`,
+              onClick: () => onAutoRefreshChange(!autoRefresh),
+            },
+              h(Icon.refresh, { width: 12, height: 12, className: autoRefresh ? "animate-spin" : "" }),
+              autoRefresh ? `Live ${countdown != null ? `(${countdown}s)` : ""}` : "Live"
+            ),
+            autoRefresh && h("div", { className:"seg" },
+              [5, 10, 30].map(s => h("button", { key: s, "data-active": refreshInterval === s, onClick: () => onIntervalChange(s) }, `${s}s`))
+            )
           )
         )
       );
@@ -635,15 +663,22 @@ function Spinner() {
       const [view, setView] = useState("heatmap");
       const [hover, setHover] = useState(null);
 
-      const { parts, buckets, grid, maxRecords, totalRecords, totalSegments } = useMemo(() => {
-        if (!segments) return { parts: [], buckets: [], grid: new Map(), maxRecords: 0, totalRecords: 0, totalSegments: 0 };
-        const parts = [...new Set(segments.map(s => s.partition))].sort((a,b) => a-b);
+      const { rows, buckets, grid, maxRecords, totalRecords, totalSegments } = useMemo(() => {
+        if (!segments) return { rows: [], buckets: [], grid: new Map(), maxRecords: 0, totalRecords: 0, totalSegments: 0 };
+        const rowKeys = new Map();
+        for (const s of segments) {
+          const key = `${s.node}||${s.partition}`;
+          if (!rowKeys.has(key)) rowKeys.set(key, { node: s.node, partition: s.partition });
+        }
+        const rows = [...rowKeys.values()].sort((a, b) => a.node.localeCompare(b.node) || a.partition - b.partition);
         const buckets = [...new Set(segments.map(s => s.start))].sort();
         const grid = new Map();
         let mx = 0, tr = 0;
-        for (const s of segments) { grid.set(`${s.partition}|${s.start}`, s); mx = Math.max(mx, s.records); tr += s.records; }
-        return { parts, buckets, grid, maxRecords: mx, totalRecords: tr, totalSegments: segments.length };
+        for (const s of segments) { grid.set(`${s.node}||${s.partition}|${s.start}`, s); mx = Math.max(mx, s.records); tr += s.records; }
+        return { rows, buckets, grid, maxRecords: mx, totalRecords: tr, totalSegments: segments.length };
       }, [segments]);
+
+      const nodeCount = rows.length > 0 ? new Set(rows.map(r => r.node)).size : 0;
 
       const heatColor = (records) => {
         if (!records) return "var(--heat-0)";
@@ -663,7 +698,8 @@ function Spinner() {
             segments && h("span", { className:"text-[13px] text-[color:var(--ink-2)]" },
               h("span", { className:"mono font-medium" }, totalSegments), " segments · ",
               h("span", { className:"mono font-medium" }, fmtNum(totalRecords)), " records · ",
-              h("span", { className:"mono font-medium" }, parts.length), " partitions × ",
+              nodeCount > 1 && h(React.Fragment, null, h("span", { className:"mono font-medium" }, nodeCount), " nodes · "),
+              h("span", { className:"mono font-medium" }, rows.length), " partitions × ",
               h("span", { className:"mono font-medium" }, buckets.length), " buckets"
             )
           ),
@@ -681,20 +717,29 @@ function Spinner() {
                 ? h("div", { className:"skeleton h-[240px]" })
                 : !segments
                   ? h("div", { className:"text-[13px] text-[color:var(--ink-3)] italic py-8 text-center" }, "Run a query to load segments.")
-                  : h(HeatmapView, { parts, buckets, grid, heatColor, hover, setHover })
+                  : h(HeatmapView, { rows, buckets, grid, heatColor, hover, setHover })
             )
           : h(SegmentsTable, { segments, loading })
       );
     }
 
-    function HeatmapView({ parts, buckets, grid, heatColor, hover, setHover }) {
+    function shortNodeName(url) {
+      if (!url || url === "self") return "self";
+      try { const u = new URL(url); return u.port || u.hostname; } catch { return url.split(":").pop() || url; }
+    }
+
+    function HeatmapView({ rows, buckets, grid, heatColor, hover, setHover }) {
       const cellW = Math.max(14, Math.min(28, Math.floor(880 / Math.max(1, buckets.length))));
       const cellH = 18;
+      const multiNode = new Set(rows.map(r => r.node)).size > 1;
 
       return h("div", null,
         h("div", { className:"flex items-stretch" },
           h("div", { className:"pr-3 flex flex-col gap-[2px] mt-[26px]" },
-            parts.map(p => h("div", { key: p, className:"mono text-[11px] text-[color:var(--ink-3)] flex items-center justify-end pr-1", style:{ height: cellH } }, `P${p}`))
+            rows.map(r => {
+              const label = multiNode ? `${shortNodeName(r.node)}/P${r.partition}` : `P${r.partition}`;
+              return h("div", { key: `${r.node}||${r.partition}`, className:"mono text-[11px] text-[color:var(--ink-3)] flex items-center justify-end pr-1", style:{ height: cellH } }, label);
+            })
           ),
           h("div", { className:"flex-1 min-w-0 overflow-x-auto" },
             h("div", { className:"flex gap-[2px] mb-1.5", style:{ height: 20 } },
@@ -708,9 +753,9 @@ function Spinner() {
               })
             ),
             h("div", { className:"flex flex-col gap-[2px]" },
-              parts.map(p => h("div", { key: p, className:"flex gap-[2px]" },
+              rows.map(r => h("div", { key: `${r.node}||${r.partition}`, className:"flex gap-[2px]" },
                 buckets.map(b => {
-                  const seg = grid.get(`${p}|${b}`);
+                  const seg = grid.get(`${r.node}||${r.partition}|${b}`);
                   const records = seg?.records || 0;
                   return h("div", {
                     key: b,
@@ -748,6 +793,10 @@ function Spinner() {
           h("div", { className:"text-[12px] mono text-[color:var(--ink-2)] min-h-[18px]" },
             hover
               ? h("span", null,
+                  multiNode && h(React.Fragment, null,
+                    h("span", { className:"text-[color:var(--ink-3)]" }, shortNodeName(hover.node)),
+                    h("span", { className:"text-[color:var(--ink-4)] mx-2" }, "·"),
+                  ),
                   h("span", { className:"text-[color:var(--ink-3)]" }, "P"), h("span", { className:"font-medium" }, hover.partition),
                   h("span", { className:"text-[color:var(--ink-4)] mx-2" }, "·"),
                   h("span", null, fmtShortTime(hover.start)),
@@ -850,6 +899,57 @@ function Spinner() {
                   h("span", { className:"chip invisible shrink-0" }, "—"),
                   h("span", { className:"mono text-[12px] text-[color:var(--ink-2)] tabular-nums w-[90px] text-right shrink-0" }, fmtNum(totalSegs) + " seg"),
                   h("span", { className:"mono text-[13px] font-semibold text-[color:var(--ink)] tabular-nums w-[100px] text-right shrink-0" }, fmtNum(totalRecs))
+                )
+              )
+      );
+    }
+
+    /* -------------------------------------------------------------------------- */
+    /*  Breakdown (time-series) panel                                            */
+    /* -------------------------------------------------------------------------- */
+    function BreakdownPanel({ breakdown, loading, refreshing, bucketSize, onBucketSize }) {
+      const buckets = breakdown?.buckets || [];
+      const max = Math.max(...buckets.map(b => b.value || 0), 1);
+
+      return h("div", { className:"card", style:{ transition:"opacity 120ms", opacity: refreshing ? 0.7 : 1 } },
+        h("div", { className:"px-5 py-3.5 flex items-center justify-between border-b hairline" },
+          h("div", { className:"flex items-center gap-2" },
+            h("span", { className:"text-[11px] font-medium uppercase tracking-wider text-[color:var(--ink-3)]" }, "Breakdown"),
+            breakdown && h("span", { className:"chip" }, `${buckets.length} buckets`),
+            breakdown?.partial && h("span", { className:"chip", style:{ color:"var(--warn)" } }, "partial"),
+            refreshing && h(Spinner, null)
+          ),
+          h("div", { className:"seg" },
+            ["1h","6h","1d"].map(s => h("button", { key: s, "data-active": bucketSize === s, onClick: () => onBucketSize(s) }, s))
+          )
+        ),
+        loading && !breakdown
+          ? h("div", { className:"p-5" }, h("div", { className:"skeleton h-[160px]" }))
+          : buckets.length === 0
+            ? h("div", { className:"p-6 text-center text-[13px] text-[color:var(--ink-3)] italic" }, "Run a query to see the time breakdown.")
+            : h("div", { className:"p-5" },
+                h("div", { className:"flex items-end gap-[2px]", style:{ height: 140 } },
+                  buckets.map((b, i) => {
+                    const pct = Math.max((b.value / max) * 100, b.value > 0 ? 2 : 0);
+                    const d = new Date(b.bucket);
+                    const hr = d.getUTCHours();
+                    const label = bucketSize === "1d"
+                      ? d.toISOString().slice(5, 10)
+                      : hr === 0 ? d.toISOString().slice(5, 10) : String(hr).padStart(2, "0") + ":00";
+                    const showLabel = buckets.length <= 48 ? true : i % Math.ceil(buckets.length / 48) === 0;
+                    return h("div", { key: b.bucket, className:"flex-1 flex flex-col items-center gap-[3px] group cursor-default", title: `${b.bucket}: ${fmtFull(b.value)}` },
+                      h("div", {
+                        className:"w-full bar-fill rounded-t-[2px] transition-all duration-300",
+                        style:{ height: `${pct}%`, minHeight: b.value > 0 ? 2 : 0 }
+                      }),
+                      showLabel && h("div", { className:"mono text-[9px] text-[color:var(--ink-4)] whitespace-nowrap" }, label)
+                    );
+                  })
+                ),
+                h("div", { className:"mt-3 flex items-center justify-between text-[11px] mono text-[color:var(--ink-3)]" },
+                  h("span", null, fmtShortTime(buckets[0]?.bucket || "")),
+                  h("span", null, "peak: ", h("span", { className:"font-medium text-[color:var(--ink)]" }, fmtNum(max))),
+                  h("span", null, fmtShortTime(buckets[buckets.length - 1]?.bucket || ""))
                 )
               )
       );
@@ -962,6 +1062,13 @@ function Spinner() {
       const [tab, setTab] = useState("explorer");
       const [nodes, setNodes] = useState(null);
       const [loadingNodes, setLoadingNodes] = useState(false);
+      const [autoRefresh, setAutoRefresh] = useState(false);
+      const [refreshInterval, setRefreshInterval] = useState(10);
+      const [countdown, setCountdown] = useState(null);
+      const [breakdown, setBreakdown] = useState(null);
+      const [loadingBreakdown, setLoadingBreakdown] = useState(false);
+      const [bucketSize, setBucketSize] = useState("1h");
+      const isAutoRefreshRun = useRef(false);
 
       const loadNodes = useCallback(async () => {
         setLoadingNodes(true);
@@ -1042,15 +1149,17 @@ function Spinner() {
         if (qRes.status === "fulfilled") {
           hasResult.current = true;
           setResult(qRes.value);
-          setHistory(h => [{
-            id: String(Date.now()).slice(-6),
-            ts: Date.now(),
-            filter: qstate.filter,
-            agg: aggObj.label,
-            value: qRes.value.value,
-            elapsedMs: qRes.value.elapsedMs,
-            state: { ...qstate },
-          }, ...h].slice(0, 12));
+          if (!isAutoRefreshRun.current) {
+            setHistory(h => [{
+              id: String(Date.now()).slice(-6),
+              ts: Date.now(),
+              filter: qstate.filter,
+              agg: aggObj.label,
+              value: qRes.value.value,
+              elapsedMs: qRes.value.elapsedMs,
+              state: { ...qstate },
+            }, ...h].slice(0, 12));
+          }
         } else {
           setQueryError(qRes.reason?.message || "Query failed");
         }
@@ -1076,6 +1185,24 @@ function Spinner() {
         const id = setInterval(check, 15_000);
         return () => clearInterval(id);
       }, []);
+
+      // Auto-refresh interval
+      useEffect(() => {
+        if (!autoRefresh) { setCountdown(null); return; }
+        setCountdown(refreshInterval);
+        const tick = setInterval(() => {
+          setCountdown(c => {
+            if (c <= 1) {
+              isAutoRefreshRun.current = true;
+              runQueryRef.current();
+              setTimeout(() => { isAutoRefreshRun.current = false; }, 0);
+              return refreshInterval;
+            }
+            return c - 1;
+          });
+        }, 1000);
+        return () => clearInterval(tick);
+      }, [autoRefresh, refreshInterval]);
 
       // Auto-run once on mount
       useEffect(() => { runQueryRef.current(); }, []);
@@ -1108,6 +1235,20 @@ function Spinner() {
         window.addEventListener("keydown", onKey);
         return () => window.removeEventListener("keydown", onKey);
       }, []);
+
+      // Breakdown fetch — debounced 600ms (slightly longer than query)
+      useEffect(() => {
+        const ac = new AbortController();
+        const t = setTimeout(async () => {
+          setLoadingBreakdown(true);
+          try {
+            const data = await apiTimeseries({ filter: qstate.filter, agg: aggObj, from: qstate.from, to: qstate.to, bucketSize }, ac.signal);
+            setBreakdown(data);
+          } catch (e) { if (e.name !== "AbortError") setBreakdown(null); }
+          setLoadingBreakdown(false);
+        }, 600);
+        return () => { clearTimeout(t); ac.abort(); };
+      }, [qstate, bucketSize]);
 
       const refreshSegments = async () => {
         setLoadingSegments(true);
@@ -1165,9 +1306,10 @@ function Spinner() {
             : tab === "segments"
             ? h(SegmentsPanel, { segments, loading: loadingSegments, refreshing, onRefresh: refreshSegments })
             : h(React.Fragment, null,
-                h(QueryBar, { state: qstate, setState: setQstate, onRun: runQuery, running: loadingQuery || refreshing }),
+                h(QueryBar, { state: qstate, setState: setQstate, onRun: runQuery, running: loadingQuery || refreshing, autoRefresh, refreshInterval, onAutoRefreshChange: setAutoRefresh, onIntervalChange: setRefreshInterval, countdown }),
                 h(ResultCard, { result, error: queryError, loading: loadingQuery, refreshing, agg: qstate.agg, filter: qstate.filter, compareItem }),
                 h(FacetsPanel, { facets, error: facetsError, loading: loadingFacets, refreshing, topN: qstate.topN, onAddFilter: addFilter, activeFilters }),
+                h(BreakdownPanel, { breakdown, loading: loadingBreakdown, refreshing, bucketSize, onBucketSize: setBucketSize }),
                 h(SegmentsPanel, { segments, loading: loadingSegments, refreshing, onRefresh: refreshSegments })
               )
         ),

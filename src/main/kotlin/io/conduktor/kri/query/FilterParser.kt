@@ -18,6 +18,19 @@ sealed interface FilterAst {
         val values: List<String>,
     ) : FilterAst
 
+    /**
+     * Range filter for numeric (uint32) fields.
+     * [lo, hi] bounds are in unsigned 32-bit space (0..4294967295).
+     * Open-ended: lo=null means no lower bound, hi=null means no upper bound.
+     */
+    data class Range(
+        val dim: String,
+        val lo: Long?,
+        val hi: Long?,
+        val loInclusive: Boolean = true,
+        val hiInclusive: Boolean = true,
+    ) : FilterAst
+
     data class And(
         val left: FilterAst,
         val right: FilterAst,
@@ -102,19 +115,58 @@ class FilterParser(
         skipWs()
         if (peek() != ':') throw FilterParseException("expected ':' after '$dim' at $pos")
         pos++
-        val values = mutableListOf(readValue())
-        while (true) {
-            val save = pos
-            skipWs()
-            if (peek() == ',') {
+        skipWs()
+        return when (peek()) {
+            '>' -> {
                 pos++
-                values.add(readValue())
-            } else {
-                pos = save
-                break
+                val inclusive = peek() == '='
+                if (inclusive) pos++
+                FilterAst.Range(dim, lo = readNumber(), hi = null, loInclusive = inclusive)
+            }
+            '<' -> {
+                pos++
+                val inclusive = peek() == '='
+                if (inclusive) pos++
+                FilterAst.Range(dim, lo = null, hi = readNumber(), hiInclusive = inclusive)
+            }
+            '[' -> {
+                pos++
+                val lo = readNumber()
+                skipWs()
+                if (peek() != ',') throw FilterParseException("expected ',' in range at $pos")
+                pos++
+                val hi = readNumber()
+                skipWs()
+                if (peek() != ']') throw FilterParseException("expected ']' at $pos")
+                pos++
+                FilterAst.Range(dim, lo = lo, hi = hi)
+            }
+            else -> {
+                val values = mutableListOf(readValue())
+                while (true) {
+                    val save = pos
+                    skipWs()
+                    if (peek() == ',') {
+                        pos++
+                        values.add(readValue())
+                    } else {
+                        pos = save
+                        break
+                    }
+                }
+                FilterAst.Predicate(dim, values)
             }
         }
-        return FilterAst.Predicate(dim, values)
+    }
+
+    private fun readNumber(): Long {
+        skipWs()
+        val start = pos
+        if (pos < src.length && src[pos] == '-') pos++
+        while (pos < src.length && src[pos].isDigit()) pos++
+        if (start == pos) throw FilterParseException("expected number at $pos")
+        return src.substring(start, pos).toLongOrNull()
+            ?: throw FilterParseException("invalid number at $start")
     }
 
     private fun readIdent(): String {

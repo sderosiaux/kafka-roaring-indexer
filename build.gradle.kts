@@ -140,11 +140,29 @@ tasks.register<JavaExec>("runIndexer") {
 
 tasks.register<JavaExec>("runBench") {
     group = "application"
-    description = "In-process ingest + query benchmark. Pass args via -Pargs='--events 20000000 --buckets 6'"
+    description = "In-process ingest + query benchmark. Pass args via -Pargs='--events 20000000 --buckets 6' or BENCH_ARGS env"
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("io.conduktor.kri.bench.BenchKt")
     jvmArgs = listOf("-Xms2g", "-Xmx6g", "-XX:+UseG1GC")
-    val extra = (project.findProperty("args") as String?)?.split(" ")?.filter { it.isNotBlank() } ?: emptyList()
+    val raw = (project.findProperty("args") as String?) ?: System.getenv("BENCH_ARGS")
+    val extra = raw?.split(" ")?.filter { it.isNotBlank() } ?: emptyList()
     args(extra)
     standardInput = System.`in`
+}
+
+tasks.register<Jar>("benchJar") {
+    group = "application"
+    description = "Fat JAR for the bench server (used by Docker)"
+    archiveClassifier.set("bench")
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    manifest { attributes["Main-Class"] = "io.conduktor.kri.bench.BenchKt" }
+    from(sourceSets["main"].output)
+    from(
+        configurations.runtimeClasspath
+            .get()
+            .map { if (it.isDirectory) it else zipTree(it) },
+    ) {
+        exclude("META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA")
+        exclude("META-INF/LICENSE*", "META-INF/NOTICE*", "META-INF/DEPENDENCIES")
+    }
 }

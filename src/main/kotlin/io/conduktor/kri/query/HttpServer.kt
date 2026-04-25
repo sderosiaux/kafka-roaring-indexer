@@ -56,6 +56,7 @@ class HttpServer(
                     }
                 }.get("/health") { ctx -> ctx.result("ok") }
                 .get("/segments") { ctx -> handleSegments(ctx) }
+                .get("/timeseries") { ctx -> handleTimeseries(ctx) }
                 .get("/query") { ctx -> handleQuery(ctx) }
                 .get("/facets") { ctx -> handleFacets(ctx) }
                 .get("/cardinality") { ctx -> handleCardinalityLegacy(ctx) }
@@ -497,10 +498,11 @@ class HttpServer(
         }
     }
 
-    private fun segmentsInfo(): List<Map<String, Any>> =
+    private fun segmentsInfo(node: String = "self"): List<Map<String, Any>> =
         store.allSegments().map { s ->
             mapOf(
                 "id" to s.id,
+                "node" to node,
                 "partition" to s.partition,
                 "tStart" to s.tStart.toString(),
                 "tEnd" to s.tEnd.toString(),
@@ -516,7 +518,7 @@ class HttpServer(
     }
 
     private fun handleSegmentsFanout(ctx: Context) {
-        val local = segmentsInfo()
+        val local = segmentsInfo(cfg.query.http.bind)
         val futures =
             cfg.query.peers.map { peer ->
                 httpClient
@@ -530,13 +532,100 @@ class HttpServer(
                     ).thenApply { resp ->
                         if (resp.statusCode() == 200) {
                             @Suppress("UNCHECKED_CAST")
-                            mapper.readValue(resp.body(), List::class.java) as List<Map<String, Any>>
+                            val list = mapper.readValue(resp.body(), List::class.java) as List<Map<String, Any>>
+                            list.map { seg -> seg + ("node" to peer) }
                         } else {
                             emptyList()
                         }
                     }.exceptionally { emptyList() }
             }
         ctx.json(local + futures.flatMap { it.get(6, TimeUnit.SECONDS) })
+    }
+
+    private fun handleTimeseries(ctx: Context) {
+        try {
+            val from = parseInstant(ctx.queryParam("from"))
+            val to = parseInstant(ctx.queryParam("to"))
+            val filter = FilterParser.parse(ctx.queryParam("filter"))
+            val agg = ctx.queryParam("agg") ?: "count"
+            val bucketSize =
+                when (ctx.queryParam("bucketSize") ?: "1h") {
+                    "1h" -> Duration.ofHours(1)
+                    "6h" -> Duration.ofHours(6)
+                    "1d" -> Duration.ofDays(1)
+                    else -> {
+                        ctx.status(400).json(mapOf("error" to "bucketSize must be 1h, 6h or 1d"))
+                        return
+                    }
+                }
+
+            if (cfg.query.peers.isEmpty()) {
+                ctx.json(mapOf("buckets" to localTimeseries(from, to, filter, agg, bucketSize)))
+            } else {
+                val selfBuckets = localTimeseries(from, to, filter, agg, bucketSize)
+                val qs = ctx.queryString() ?: ""
+                val peerFutures =
+                    cfg.query.peers.map { peer ->
+                        httpClient
+                            .sendAsync(
+                                HttpRequest
+                                    .newBuilder(URI("$peer/timeseries?$qs"))
+                                    .timeout(Duration.ofSeconds(15))
+                                    .GET()
+                                    .build(),
+                                HttpResponse.BodyHandlers.ofString(),
+                            ).thenApply<List<Map<String, Any?>>?> { resp ->
+                                if (resp.statusCode() != 200) return@thenApply null
+                                @Suppress("UNCHECKED_CAST")
+                                (parseJsonMap(resp.body())["buckets"] as? List<Map<String, Any?>>)
+                            }.exceptionally { null }
+                    }
+                val peerResults = peerFutures.mapNotNull { it.get(18, TimeUnit.SECONDS) }
+                val partial = peerResults.size < cfg.query.peers.size
+                val merged =
+                    selfBuckets.map { selfBucket ->
+                        val bucket = selfBucket["bucket"] as String
+                        val selfVal = (selfBucket["value"] as? Number)?.toLong() ?: 0L
+                        val peerSum =
+                            peerResults.sumOf { peer ->
+                                val match = peer.firstOrNull { (it["bucket"] as? String) == bucket }
+                                (match?.get("value") as? Number)?.toLong() ?: 0L
+                            }
+                        mapOf("bucket" to bucket, "value" to selfVal + peerSum)
+                    }
+                val resp = mutableMapOf<String, Any?>("buckets" to merged)
+                if (partial) resp["partial"] = true
+                ctx.json(resp)
+            }
+        } catch (e: FilterParseException) {
+            ctx.status(400).json(mapOf("error" to "filter parse: ${e.message}"))
+        } catch (e: Exception) {
+            log.error("timeseries failed", e)
+            ctx.status(500).json(mapOf("error" to e.message))
+        }
+    }
+
+    private fun localTimeseries(
+        from: Instant?,
+        to: Instant?,
+        filter: FilterAst,
+        agg: String,
+        bucketSize: Duration,
+    ): List<Map<String, Any?>> {
+        val allSegs = store.allSegments()
+        val effectiveFrom = from ?: allSegs.minOfOrNull { it.tStart } ?: Instant.EPOCH
+        val effectiveTo = to ?: allSegs.maxOfOrNull { it.tEnd } ?: Instant.now()
+        val result = mutableListOf<Map<String, Any?>>()
+        var cur = effectiveFrom
+        while (cur.isBefore(effectiveTo)) {
+            val candidate = cur.plus(bucketSize)
+            val next = if (candidate.isBefore(effectiveTo)) candidate else effectiveTo
+            val segs = store.segmentsOverlapping(cur, next, null)
+            val resp = evaluator.evaluate(segs, QueryRequest(cur, next, filter, agg))
+            result += mapOf("bucket" to cur.toString(), "value" to resp.result)
+            cur = next
+        }
+        return result
     }
 
     private fun handleCardinalityLegacy(ctx: Context) {

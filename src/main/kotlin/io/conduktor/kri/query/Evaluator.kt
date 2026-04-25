@@ -8,6 +8,7 @@ import io.conduktor.kri.index.RawUInt32Encoder
 import io.conduktor.kri.index.Segment
 import org.roaringbitmap.FastAggregation
 import org.roaringbitmap.RoaringBitmap
+import org.slf4j.LoggerFactory
 import java.time.Instant
 import java.util.concurrent.ForkJoinPool
 
@@ -29,6 +30,7 @@ data class QueryResponse(
 class Evaluator(
     private val cfg: IndexerConfig,
 ) {
+    private val log = LoggerFactory.getLogger(javaClass)
     private val poolLazy =
         lazy {
             val p = cfg.query.parallelism ?: Runtime.getRuntime().availableProcessors()
@@ -173,6 +175,7 @@ class Evaluator(
         when (ast) {
             FilterAst.True -> seg.memberUniverse()
             is FilterAst.Predicate -> predicateToBitmap(seg, ast)
+            is FilterAst.Range -> rangeToBitmap(seg, ast)
             is FilterAst.And -> {
                 val a = evalFilter(seg, ast.left)
                 val b = evalFilter(seg, ast.right)
@@ -192,6 +195,36 @@ class Evaluator(
 
     fun shutdown() {
         if (poolLazy.isInitialized()) pool.shutdown()
+    }
+
+    private fun rangeToBitmap(
+        seg: Segment,
+        r: FilterAst.Range,
+    ): RoaringBitmap {
+        val enc = seg.dimEncoder(r.dim) ?: return RoaringBitmap()
+        if (enc !is RawUInt32Encoder) {
+            log.warn("range filter on non-uint32 dim '{}' — returning empty", r.dim)
+            return RoaringBitmap()
+        }
+        val valueMap = seg.dims[r.dim] ?: return RoaringBitmap()
+        val acc = RoaringBitmap()
+        for ((rawId, _) in valueMap) {
+            val v = rawId.toLong() and 0xFFFF_FFFFL
+            val inRange =
+                when {
+                    r.lo != null && r.hi != null ->
+                        (if (r.loInclusive) v >= r.lo else v > r.lo) &&
+                            (if (r.hiInclusive) v <= r.hi else v < r.hi)
+                    r.lo != null -> if (r.loInclusive) v >= r.lo else v > r.lo
+                    r.hi != null -> if (r.hiInclusive) v <= r.hi else v < r.hi
+                    else -> false
+                }
+            if (inRange) {
+                val bm = seg.dimValueBitmap(r.dim, rawId) ?: continue
+                acc.or(bm)
+            }
+        }
+        return acc
     }
 
     private fun predicateToBitmap(
