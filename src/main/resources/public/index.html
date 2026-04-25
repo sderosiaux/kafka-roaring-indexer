@@ -907,9 +907,10 @@ function Spinner() {
     /* -------------------------------------------------------------------------- */
     /*  Breakdown (time-series) panel                                            */
     /* -------------------------------------------------------------------------- */
-    function BreakdownPanel({ breakdown, loading, refreshing, bucketSize, onBucketSize }) {
+    function BreakdownPanel({ breakdown, loading, refreshing, bucketSize, onBucketSize, hasTimeRange }) {
       const buckets = breakdown?.buckets || [];
-      const max = Math.max(...buckets.map(b => b.value || 0), 1);
+      const max = buckets.reduce((m, b) => Math.max(m, b.value || 0), 1);
+      const visible = buckets.length > 400 ? buckets.filter((_, i) => i % Math.ceil(buckets.length / 400) === 0) : buckets;
 
       return h("div", { className:"card", style:{ transition:"opacity 120ms", opacity: refreshing ? 0.7 : 1 } },
         h("div", { className:"px-5 py-3.5 flex items-center justify-between border-b hairline" },
@@ -925,11 +926,13 @@ function Spinner() {
         ),
         loading && !breakdown
           ? h("div", { className:"p-5" }, h("div", { className:"skeleton h-[160px]" }))
-          : buckets.length === 0
-            ? h("div", { className:"p-6 text-center text-[13px] text-[color:var(--ink-3)] italic" }, "Run a query to see the time breakdown.")
+          : !hasTimeRange
+            ? h("div", { className:"p-6 text-center text-[13px] text-[color:var(--ink-3)] italic" }, "Select a time range to see the breakdown.")
+            : buckets.length === 0
+            ? h("div", { className:"p-6 text-center text-[13px] text-[color:var(--ink-3)] italic" }, "No data in this time window.")
             : h("div", { className:"p-5" },
                 h("div", { className:"flex items-end gap-[2px]", style:{ height: 140 } },
-                  buckets.map((b, i) => {
+                  visible.map((b, i) => {
                     const pct = Math.max((b.value / max) * 100, b.value > 0 ? 2 : 0);
                     const d = new Date(b.bucket);
                     const hr = d.getUTCHours();
@@ -950,7 +953,8 @@ function Spinner() {
                   h("span", null, fmtShortTime(buckets[0]?.bucket || "")),
                   h("span", null, "peak: ", h("span", { className:"font-medium text-[color:var(--ink)]" }, fmtNum(max))),
                   h("span", null, fmtShortTime(buckets[buckets.length - 1]?.bucket || ""))
-                )
+                ),
+                buckets.length > 400 && h("div", { className:"mt-1 text-[10px] mono text-[color:var(--ink-4)] text-center" }, `${buckets.length} buckets — showing 1 in ${Math.ceil(buckets.length / 400)}`)
               )
       );
     }
@@ -1236,8 +1240,9 @@ function Spinner() {
         return () => window.removeEventListener("keydown", onKey);
       }, []);
 
-      // Breakdown fetch — debounced 600ms (slightly longer than query)
+      // Breakdown fetch — only when an explicit time range is set
       useEffect(() => {
+        if (!qstate.from || !qstate.to) { setBreakdown(null); return; }
         const ac = new AbortController();
         const t = setTimeout(async () => {
           setLoadingBreakdown(true);
@@ -1309,7 +1314,7 @@ function Spinner() {
                 h(QueryBar, { state: qstate, setState: setQstate, onRun: runQuery, running: loadingQuery || refreshing, autoRefresh, refreshInterval, onAutoRefreshChange: setAutoRefresh, onIntervalChange: setRefreshInterval, countdown }),
                 h(ResultCard, { result, error: queryError, loading: loadingQuery, refreshing, agg: qstate.agg, filter: qstate.filter, compareItem }),
                 h(FacetsPanel, { facets, error: facetsError, loading: loadingFacets, refreshing, topN: qstate.topN, onAddFilter: addFilter, activeFilters }),
-                h(BreakdownPanel, { breakdown, loading: loadingBreakdown, refreshing, bucketSize, onBucketSize: setBucketSize }),
+                h(BreakdownPanel, { breakdown, loading: loadingBreakdown, refreshing, bucketSize, onBucketSize: setBucketSize, hasTimeRange: !!(qstate.from && qstate.to) }),
                 h(SegmentsPanel, { segments, loading: loadingSegments, refreshing, onRefresh: refreshSegments })
               )
         ),
