@@ -302,6 +302,12 @@ data class Query(
     val parallelism: Int? = null,
     /** Segments >= this threshold switch to parallel eval; below, sequential (overhead avoidance). */
     val parallelThreshold: Int = 8,
+    /**
+     * Other KRI instances to fan-out queries to (Option C multi-consumer).
+     * Self is always queried in-memory; list only the other peers.
+     * e.g. ["http://kri-1.kri:8080", "http://kri-2.kri:8080"]
+     */
+    val peers: List<String> = emptyList(),
 )
 
 @Serializable

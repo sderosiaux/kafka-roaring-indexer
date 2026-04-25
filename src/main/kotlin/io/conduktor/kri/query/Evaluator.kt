@@ -151,6 +151,15 @@ class Evaluator(
         )
     }
 
+    /** Union of per-segment filtered bitmaps — the raw membership result before aggregation. */
+    fun evalMergedBitmap(
+        segments: List<Segment>,
+        filter: FilterAst,
+    ): RoaringBitmap {
+        val bitmaps = evalPerSegment(segments, filter)
+        return if (bitmaps.isEmpty()) RoaringBitmap() else FastAggregation.or(*bitmaps.toTypedArray())
+    }
+
     /**
      * Reduces the filter to a RoaringBitmap within one segment.
      * Uses [Segment.dimValueBitmap] / [Segment.memberUniverse] which snapshot (clone) bitmaps
