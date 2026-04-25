@@ -23,8 +23,10 @@ fun main(args: Array<String>) {
     val nPaths = opts["paths"]?.toInt() ?: 20_000
     val nPartitions = opts["partitions"]?.toInt() ?: 4
     val serve = "serve" in opts || args.contains("--serve")
+    val port = opts["port"]?.toInt()
+    val peers = opts["peers"]?.split(",")?.map { it.trim() }?.filter { it.isNotEmpty() } ?: emptyList()
 
-    require(nEvents > 0) { "events must be > 0" }
+    require(nEvents >= 0) { "events must be >= 0" }
     require(nBuckets > 0) { "buckets must be > 0" }
     require(nUsers > 0) { "users must be > 0" }
     require(nPaths > 0) { "paths must be > 0" }
@@ -32,7 +34,17 @@ fun main(args: Array<String>) {
 
     println("bench: events=$nEvents buckets=$nBuckets partitions=$nPartitions users=$nUsers paths=$nPaths")
 
-    val cfg = ConfigLoader.parseOnly(BENCH_CFG)
+    var cfg = ConfigLoader.parseOnly(BENCH_CFG)
+    if (port != null || peers.isNotEmpty()) {
+        cfg =
+            cfg.copy(
+                query =
+                    cfg.query.copy(
+                        http = if (port != null) cfg.query.http.copy(bind = "0.0.0.0:$port") else cfg.query.http,
+                        peers = peers,
+                    ),
+            )
+    }
     val store = SegmentStore(cfg)
     val evaluator = Evaluator(cfg)
 
@@ -330,7 +342,9 @@ fun main(args: Array<String>) {
 
     if (serve) {
         println()
-        println("serve: starting HTTP on http://localhost:8080/")
+        val bindPort = port ?: 8080
+        println("serve: starting HTTP on http://localhost:$bindPort/")
+        if (peers.isNotEmpty()) println("serve: coordinator mode, peers=${peers.joinToString()}")
         val http = HttpServer(cfg, store, evaluator)
         http.start()
         Runtime.getRuntime().addShutdownHook(
