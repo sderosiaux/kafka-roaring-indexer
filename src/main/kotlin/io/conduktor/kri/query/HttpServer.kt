@@ -55,7 +55,7 @@ class HttpServer(
                         cors.addRule { it.anyHost() }
                     }
                 }.get("/health") { ctx -> ctx.result("ok") }
-                .get("/segments") { ctx -> ctx.json(segmentsInfo()) }
+                .get("/segments") { ctx -> handleSegments(ctx) }
                 .get("/query") { ctx -> handleQuery(ctx) }
                 .get("/facets") { ctx -> handleFacets(ctx) }
                 .get("/cardinality") { ctx -> handleCardinalityLegacy(ctx) }
@@ -510,6 +510,34 @@ class HttpServer(
                 "offsets" to s.offsets.mapValues { mapOf("first" to it.value.first, "last" to it.value.last) },
             )
         }
+
+    private fun handleSegments(ctx: Context) {
+        if (cfg.query.peers.isEmpty()) ctx.json(segmentsInfo()) else handleSegmentsFanout(ctx)
+    }
+
+    private fun handleSegmentsFanout(ctx: Context) {
+        val local = segmentsInfo()
+        val futures =
+            cfg.query.peers.map { peer ->
+                httpClient
+                    .sendAsync(
+                        HttpRequest
+                            .newBuilder(URI("$peer/segments"))
+                            .timeout(Duration.ofSeconds(5))
+                            .GET()
+                            .build(),
+                        HttpResponse.BodyHandlers.ofString(),
+                    ).thenApply { resp ->
+                        if (resp.statusCode() == 200) {
+                            @Suppress("UNCHECKED_CAST")
+                            mapper.readValue(resp.body(), List::class.java) as List<Map<String, Any>>
+                        } else {
+                            emptyList()
+                        }
+                    }.exceptionally { emptyList() }
+            }
+        ctx.json(local + futures.flatMap { it.get(6, TimeUnit.SECONDS) })
+    }
 
     private fun handleCardinalityLegacy(ctx: Context) {
         val dim = ctx.queryParam("dim") ?: return ctx.status(400).json(mapOf("error" to "dim required")).let {}
