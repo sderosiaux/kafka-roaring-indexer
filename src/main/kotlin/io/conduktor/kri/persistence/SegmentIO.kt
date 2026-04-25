@@ -3,9 +3,12 @@ package io.conduktor.kri.persistence
 import com.dynatrace.hash4j.distinctcount.UltraLogLog
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import com.github.luben.zstd.ZstdInputStream
+import com.github.luben.zstd.ZstdOutputStream
 import io.conduktor.kri.config.IndexerConfig
 import io.conduktor.kri.config.Member
 import io.conduktor.kri.config.Metric
+import io.conduktor.kri.config.Storage
 import io.conduktor.kri.index.DictEncoder
 import io.conduktor.kri.index.Segment
 import org.roaringbitmap.RoaringBitmap
@@ -14,6 +17,8 @@ import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.InputStream
+import java.io.OutputStream
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
@@ -142,8 +147,7 @@ class SegmentIO(
         dir: Path,
     ) {
         seg.dims.forEach { (dim, valueMap) ->
-            val f = dir.resolve("$dim.rbi").toFile()
-            DataOutputStream(FileOutputStream(f).buffered()).use { out ->
+            DataOutputStream(openOutputStream(dir.resolve("$dim.rbi"))).use { out ->
                 out.writeInt(valueMap.size)
                 valueMap.forEach { (valueId, bm) ->
                     out.writeInt(valueId)
@@ -162,32 +166,28 @@ class SegmentIO(
         seg: Segment,
         dir: Path,
     ) {
-        cfg.dimensions.forEach { d ->
-            val enc = seg.dimEncoder(d.name)
-            if (enc is DictEncoder) {
-                val dict = enc.dict()
-                Files.newBufferedWriter(dir.resolve("${d.name}.dict")).use { w ->
-                    dict.entries().forEach { (value, id) ->
-                        w.write(id.toString())
-                        w.write('\t'.code)
-                        w.write(value.replace("\n", "\\n").replace("\t", "\\t"))
-                        w.write('\n'.code)
-                    }
+        fun writeDict(
+            path: Path,
+            entries: Sequence<Pair<String, Int>>,
+        ) {
+            openOutputStream(path).bufferedWriter().use { w ->
+                entries.forEach { (value, id) ->
+                    w.write(id.toString())
+                    w.write('\t'.code)
+                    w.write(value.replace("\n", "\\n").replace("\t", "\\t"))
+                    w.write('\n'.code)
                 }
             }
         }
-        // Member dict if applicable.
+        cfg.dimensions.forEach { d ->
+            val enc = seg.dimEncoder(d.name)
+            if (enc is DictEncoder) {
+                writeDict(dir.resolve("${d.name}.dict"), enc.dict().entries().asSequence())
+            }
+        }
         if (cfg.member.encoding == Member.Encoding.DICT) {
-            val md = seg.memberEncoder().dict()
-            if (md != null) {
-                Files.newBufferedWriter(dir.resolve("_member.dict")).use { w ->
-                    md.entries().forEach { (value, id) ->
-                        w.write(id.toString())
-                        w.write('\t'.code)
-                        w.write(value)
-                        w.write('\n'.code)
-                    }
-                }
+            seg.memberEncoder().dict()?.let { md ->
+                writeDict(dir.resolve("_member.dict"), md.entries().asSequence())
             }
         }
     }
@@ -197,7 +197,7 @@ class SegmentIO(
         dir: Path,
     ) {
         seg.ullSketches.forEach { (name, sliceMap) ->
-            DataOutputStream(FileOutputStream(dir.resolve("$name.ull").toFile()).buffered()).use { out ->
+            DataOutputStream(openOutputStream(dir.resolve("$name.ull"))).use { out ->
                 out.writeInt(sliceMap.size)
                 sliceMap.forEach { (slice, sk) ->
                     out.writeInt(slice.size)
@@ -208,11 +208,39 @@ class SegmentIO(
                 }
             }
         }
+        // Counters and sums are 8 bytes — not worth compressing.
         seg.counters.forEach { (name, v) ->
-            DataOutputStream(FileOutputStream(dir.resolve("$name.count").toFile())).use { out -> out.writeLong(v.get()) }
+            DataOutputStream(FileOutputStream(dir.resolve("$name.count").toFile())).use { it.writeLong(v.get()) }
         }
         seg.sums.forEach { (name, v) ->
-            DataOutputStream(FileOutputStream(dir.resolve("$name.sum").toFile())).use { out -> out.writeLong(v.get()) }
+            DataOutputStream(FileOutputStream(dir.resolve("$name.sum").toFile())).use { it.writeLong(v.get()) }
+        }
+    }
+
+    /** Wraps with ZstdOutputStream when compression is enabled. */
+    private fun openOutputStream(path: Path): OutputStream {
+        val raw = FileOutputStream(path.toFile()).buffered()
+        return if (cfg.storage.compress == Storage.Compress.ZSTD) ZstdOutputStream(raw, 3) else raw
+    }
+
+    /**
+     * Auto-detects zstd via magic bytes (0x28 0xB5 0x2F 0xFD).
+     * Backward-compatible: uncompressed segments are read as-is.
+     */
+    private fun openInputStream(path: Path): InputStream {
+        val raw = FileInputStream(path.toFile()).buffered()
+        raw.mark(4)
+        val header = raw.readNBytes(4)
+        raw.reset()
+        return if (header.size == 4 &&
+            header[0] == 0x28.toByte() &&
+            header[1] == 0xB5.toByte() &&
+            header[2] == 0x2F.toByte() &&
+            header[3] == 0xFD.toByte()
+        ) {
+            ZstdInputStream(raw)
+        } else {
+            raw
         }
     }
 
@@ -231,13 +259,12 @@ class SegmentIO(
             if (Files.exists(f)) {
                 val enc = seg.dimEncoder(d.name)
                 if (enc is DictEncoder) {
-                    val entries =
-                        Files.readAllLines(f).mapNotNull { line ->
+                    openInputStream(f).bufferedReader().useLines { lines ->
+                        lines.forEach { line ->
                             val parts = line.split('\t', limit = 2)
-                            if (parts.size != 2) null else parts[1].replace("\\n", "\n") to parts[0].toInt()
+                            if (parts.size == 2) enc.dict().getOrIntern(parts[1].replace("\\n", "\n"), null)
                         }
-                    // Rebuild dict by replacing
-                    entries.forEach { (value, _) -> enc.dict().getOrIntern(value, null) }
+                    }
                 }
             }
         }
@@ -247,7 +274,7 @@ class SegmentIO(
         cfg.dimensions.forEach { d ->
             val f = dimsDir.resolve("${d.name}.rbi")
             if (Files.exists(f)) {
-                DataInputStream(FileInputStream(f.toFile()).buffered()).use { inp ->
+                DataInputStream(openInputStream(f)).use { inp ->
                     val n = inp.readInt()
                     val map = seg.dims.getValue(d.name)
                     repeat(n) {
@@ -270,7 +297,7 @@ class SegmentIO(
                 Metric.Type.ULL -> {
                     val f = metricsDir.resolve("${m.name}.ull")
                     if (Files.exists(f)) {
-                        DataInputStream(FileInputStream(f.toFile()).buffered()).use { inp ->
+                        DataInputStream(openInputStream(f)).use { inp ->
                             val n = inp.readInt()
                             val map = seg.ullSketches.getValue(m.name)
                             repeat(n) {

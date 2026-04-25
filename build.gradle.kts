@@ -134,7 +134,8 @@ tasks.register<JavaExec>("runIndexer") {
     group = "application"
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("io.conduktor.kri.MainKt")
-    args("--config", "examples/events-analytics.yaml")
+    val configPath = project.findProperty("config") as String? ?: "indexer.yaml"
+    args("--config", configPath)
 }
 
 tasks.register<JavaExec>("runBench") {
