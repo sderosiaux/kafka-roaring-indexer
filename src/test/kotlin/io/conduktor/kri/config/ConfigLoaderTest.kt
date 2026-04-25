@@ -9,7 +9,8 @@ import java.nio.file.Path
 class ConfigLoaderTest {
     @Test
     fun `loads example events-analytics yaml`() {
-        val cfg = ConfigLoader.loadAndValidate(Path.of("examples/events-analytics.yaml"))
+        val res = ConfigLoaderTest::class.java.classLoader.getResource("events-analytics.yaml")!!
+        val cfg = ConfigLoader.loadAndValidate(Path.of(res.toURI()))
         assertThat(cfg.metadata.name).isEqualTo("events-analytics-poc")
         assertThat(cfg.dimensions).extracting("name").contains("country", "device", "status", "latencyBucket", "pathHashed")
         assertThat(cfg.metrics).extracting("name").contains("distinctUsers", "distinctPaths", "requestCount", "totalLatencyMs")

@@ -74,7 +74,7 @@ Things it deliberately does **not** do:
 - Distributed queries. One process, one topic, one member type.
 - Exact count-distinct on fields without an explicit dict (use a sketch or pick your encoding).
 
-The design note lives in [`SPEC.md`](SPEC.md). Full example config: [`examples/events-analytics.yaml`](examples/events-analytics.yaml). Schema: [`schema/indexer.schema.json`](schema/indexer.schema.json).
+The DSL is a single YAML validated at boot against the bundled JSON Schema. See the inline config in `Bench.kt` (`BENCH_CFG`) for a working example.
 
 ## What's interesting in the design
 
@@ -275,7 +275,7 @@ The niche here: **single-binary, consumer-side, declarative, opinionated**. Not 
 
 ## Status
 
-POC implementation complete against `SPEC.md` milestones M1 through M11. Design doc is intentionally ahead of the code: several knobs (protobuf Schema Registry, zstd segment compression, multi-partition ownership on rebalance, dict snapshot cadence) are sketched but not load-bearing yet.
+POC. Ingest, persistence, parallel query, retention GC, and the explorer UI are all functional. Not yet: protobuf Schema Registry, zstd segment compression, multi-consumer partition assignment.
 
 ## License
 
