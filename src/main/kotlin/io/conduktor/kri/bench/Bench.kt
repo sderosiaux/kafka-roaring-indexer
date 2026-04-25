@@ -370,9 +370,15 @@ private fun parseOpts(args: Array<String>): Map<String, String> {
     var i = 0
     while (i < args.size) {
         val k = args[i]
-        if (k.startsWith("--") && i + 1 < args.size) {
-            m[k.removePrefix("--")] = args[i + 1]
-            i += 2
+        if (k.startsWith("--")) {
+            val next = args.getOrNull(i + 1)
+            if (next != null && !next.startsWith("--")) {
+                m[k.removePrefix("--")] = next
+                i += 2
+            } else {
+                m[k.removePrefix("--")] = "true"
+                i += 1
+            }
         } else {
             i++
         }
