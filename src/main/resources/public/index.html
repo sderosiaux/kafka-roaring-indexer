@@ -117,13 +117,12 @@
     /* -------------------------------------------------------------------------- */
     const API = "";  // same origin
 
-    async function apiQuery({ filter, agg, from, to, partitions }, signal) {
+    async function apiQuery({ filter, agg, from, to }, signal) {
       const p = new URLSearchParams();
       if (from) p.set("from", from);
       if (to) p.set("to", to);
       if (filter && filter.trim()) p.set("filter", filter.trim());
       p.set("agg", agg.apiAgg || agg.id);
-      if (partitions && partitions.length > 0) p.set("partitions", partitions.join(","));
       const t0 = Date.now();
       const r = await fetch(API + "/query?" + p.toString(), { signal });
       const elapsed = Date.now() - t0;
@@ -143,13 +142,12 @@
       };
     }
 
-    async function apiFacets({ filter, top, from, to, partitions }, signal) {
+    async function apiFacets({ filter, top, from, to }, signal) {
       const p = new URLSearchParams();
       if (from) p.set("from", from);
       if (to) p.set("to", to);
       if (filter && filter.trim()) p.set("filter", filter.trim());
       if (top) p.set("topN", String(top));
-      if (partitions && partitions.length > 0) p.set("partitions", partitions.join(","));
       const r = await fetch(API + "/facets?" + p.toString(), { signal });
       const data = await r.json();
       if (data.error) throw new Error(data.error);
@@ -165,18 +163,17 @@
       return result;
     }
 
-    async function apiSegments({ from, to, partitions }, signal) {
+    async function apiSegments({ from, to }, signal) {
       const r = await fetch(API + "/segments", { signal });
       const data = await r.json();
       if (!Array.isArray(data)) return [];
       const fromMs = from ? +new Date(from) : 0;
       const toMs = to ? +new Date(to) : Infinity;
-      const partsSet = new Set(partitions || []);
       return data
         .filter(s => {
           const sStart = +new Date(s.tStart);
           const sEnd = +new Date(s.tEnd);
-          return sStart < toMs && sEnd > fromMs && (partsSet.size === 0 || partsSet.has(s.partition));
+          return sStart < toMs && sEnd > fromMs;
         })
         .map(s => ({
           id: s.id,
@@ -343,9 +340,8 @@
     /*  Query bar                                                                 */
     /* -------------------------------------------------------------------------- */
     function QueryBar({ state, setState, onRun, running }) {
-      const { filter, agg, preset, from, to, partitions, topN } = state;
+      const { filter, agg, preset, from, to, topN } = state;
       const [showLegend, setShowLegend] = useState(false);
-      const [showPartitions, setShowPartitions] = useState(false);
       const update = (patch) => setState(s => ({ ...s, ...patch }));
 
       return h("div", { className:"card p-4 pop-in" },
@@ -433,18 +429,6 @@
             h("span", { className:"text-[11px] font-medium uppercase tracking-wider text-[color:var(--ink-3)]" }, "Agg"),
             h(AggSelect, { value: agg, onChange: (v) => update({ agg: v }) })
           ),
-          h("div", { className:"h-6 w-px bg-[color:var(--line)]" }),
-          h("button", {
-            onClick: () => setShowPartitions(v => !v),
-            className:"flex items-center gap-1.5 text-[12px] text-[color:var(--ink-2)] hover:text-[color:var(--ink)]"
-          },
-            h(Icon.caret, { width:12, height:12, style:{ transform: showPartitions ? "rotate(180deg)" : "none", transition:"transform 160ms" } }),
-            "Partitions",
-            partitions.length === 0
-              ? h("span", { className:"chip" }, "all")
-              : h("span", { className:"chip chip-accent" }, partitions.join(", "))
-          ),
-          showPartitions && h(PartitionPicker, { selected: partitions, onChange: (p) => update({ partitions: p }) }),
           h("div", { className:"flex-1" }),
           h("div", { className:"flex items-center gap-2 text-[12px] text-[color:var(--ink-2)]" },
             "Top",
@@ -474,23 +458,7 @@
       );
     }
 
-    function PartitionPicker({ selected, onChange }) {
-      const all = [0,1,2,3,4,5,6,7,8,9,10,11];
-      const toggle = (p) => onChange(selected.includes(p) ? selected.filter(x => x !== p) : [...selected, p].sort((a,b)=>a-b));
-      return h("div", { className:"flex items-center gap-1.5 pop-in" },
-        h("button", { className:"btn btn-sm", onClick: () => onChange([]) }, "All"),
-        h("div", { className:"h-4 w-px bg-[color:var(--line)] mx-1" }),
-        all.map(p => h("button", {
-          key: p, onClick: () => toggle(p),
-          className: "h-6 min-w-6 px-1.5 rounded-md mono text-[11.5px] border hairline-2 transition-colors",
-          style: selected.includes(p)
-            ? { background: "var(--accent)", color: "white", borderColor: "var(--accent-2)" }
-            : { background: "var(--surface)", color: "var(--ink-2)" }
-        }, p))
-      );
-    }
-
-    function Spinner() {
+function Spinner() {
       return h("svg", { width:12, height:12, viewBox:"0 0 16 16", className:"animate-spin" },
         h("circle", { cx:8, cy:8, r:6, stroke:"currentColor", strokeOpacity:0.3, strokeWidth:1.8, fill:"none" }),
         h("path", { d:"M14 8a6 6 0 0 0-6-6", stroke:"currentColor", strokeWidth:1.8, strokeLinecap:"round", fill:"none" }));
@@ -1011,7 +979,6 @@
         preset: "all",
         from: null,
         to: null,
-        partitions: [],
         topN: 10,
       });
 
@@ -1046,7 +1013,7 @@
         } else {
           setRefreshing(true);
           // Filter change → clear facets immediately so stale data from a different
-          // filter doesn't mislead. Agg/preset/partition changes keep stale (less confusing).
+          // filter doesn't mislead. Agg/preset/time changes keep stale (less confusing).
           const prevFilter = prevQstate.current?.filter;
           if (prevFilter !== undefined && prevFilter !== qstate.filter) {
             setFacets(null);
@@ -1061,7 +1028,6 @@
           agg: aggObj,
           from: qstate.from,
           to: qstate.to,
-          partitions: qstate.partitions,
           top: qstate.topN,
         };
 
@@ -1124,7 +1090,6 @@
         const filterOnly = prev.filter !== qstate.filter &&
           prev.agg === qstate.agg && prev.preset === qstate.preset &&
           prev.from === qstate.from && prev.to === qstate.to &&
-          JSON.stringify(prev.partitions) === JSON.stringify(qstate.partitions) &&
           prev.topN === qstate.topN;
         if (filterOnly) {
           const t = setTimeout(() => runQueryRef.current(), 500);
@@ -1147,7 +1112,7 @@
       const refreshSegments = async () => {
         setLoadingSegments(true);
         try {
-          const s = await apiSegments({ from: qstate.from, to: qstate.to, partitions: qstate.partitions });
+          const s = await apiSegments({ from: qstate.from, to: qstate.to });
           setSegments(s);
         } catch {}
         setLoadingSegments(false);
