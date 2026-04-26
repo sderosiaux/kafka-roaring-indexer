@@ -1,10 +1,12 @@
 package io.conduktor.kri.persistence
 
 import io.conduktor.kri.config.ConfigLoader
+import io.conduktor.kri.index.IndexModelKind
 import io.conduktor.kri.index.Segment
 import io.conduktor.kri.index.SegmentStore
 import io.conduktor.kri.query.Evaluator
 import io.conduktor.kri.query.FilterParser
+import io.conduktor.kri.query.MultiModelEvaluator
 import io.conduktor.kri.query.QueryRequest
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.Test
@@ -66,5 +68,86 @@ class SegmentIOTest {
                 QueryRequest(Instant.EPOCH, Instant.EPOCH.plusSeconds(7200), FilterParser.parse("country:DE"), "cardinality"),
             )
         assertThat(deResp.result).isEqualTo(1L)
+    }
+
+    @Test
+    fun `round-trip persists experimental models and queries match before-after`(
+        @TempDir tmp: Path,
+    ) {
+        val yaml =
+            """
+            apiVersion: indexer.conduktor.io/v1
+            kind: IndexerConfig
+            metadata: { name: persist-models-test }
+            source: { topic: events, bootstrap: b:9092, consumerGroup: g }
+            segmentation: { strategy: time, bucket: 1h }
+            fields:
+              userId:    { path: userId,    type: uint32 }
+              country:   { path: country,   type: string }
+              latencyMs: { path: latencyMs, type: uint32 }
+            member: { field: userId, encoding: raw_uint32 }
+            dimensions:
+              - { name: country,   field: country,   encoding: dict }
+              - { name: latencyMs, field: latencyMs, encoding: raw_uint32 }
+            metrics:
+              - { name: requestCount, type: count }
+            storage: { path: $tmp }
+            experimentalModels:
+              bsiDims: [latencyMs]
+              thetaSample: true
+              thetaSampleRate: 0.5
+              jointProfile: true
+              reorderMembers: true
+            """.trimIndent()
+        val cfg = ConfigLoader.parseOnly(yaml)
+        val seg = Segment.create(0, 0, Instant.EPOCH, Instant.EPOCH.plusSeconds(3600), cfg)
+        val countries = listOf("FR", "DE", "IT", "ES")
+        repeat(100) { i ->
+            seg.add(
+                0,
+                i.toLong(),
+                mapOf(
+                    "userId" to (i + 1).toLong(),
+                    "country" to countries[i % countries.size],
+                    "latencyMs" to (10 + i * 3).toLong(),
+                ),
+            )
+        }
+        seg.freeze()
+
+        // Capture in-memory results before persistence.
+        val ev = Evaluator(cfg)
+        val mev = MultiModelEvaluator(cfg, ev)
+        val req =
+            QueryRequest(
+                Instant.EPOCH,
+                Instant.EPOCH.plusSeconds(3600),
+                FilterParser.parse("country:FR AND latencyMs:[100,200]"),
+                "cardinality",
+            )
+        val before = mev.evaluate(listOf(seg), req, listOf(IndexModelKind.ROARING, IndexModelKind.BSI, IndexModelKind.JOINT_PROFILE))
+
+        // Persist + reload via a fresh store.
+        val io = SegmentIO(cfg)
+        io.write(seg)
+        val store = SegmentStore(cfg)
+        io.loadAll(store, AtomicLong(0))
+        val loaded = store.allSegments().single()
+
+        // Confirm experimental state survived.
+        assertThat(loaded.bsi).containsKey("latencyMs")
+        assertThat(loaded.theta).isNotNull
+        assertThat(loaded.jointProfile).isNotNull
+        assertThat(loaded.memberPermutation).isNotNull
+        assertThat(loaded.reorderedDims).isNotNull
+
+        val ev2 = Evaluator(cfg)
+        val mev2 = MultiModelEvaluator(cfg, ev2)
+        val after = mev2.evaluate(listOf(loaded), req, listOf(IndexModelKind.ROARING, IndexModelKind.BSI))
+        // Roaring must match exactly. BSI works for the range half so it should agree too
+        // since our test filter has BSI'd dim on the range and Roaring on the AND-categorical.
+        before.zip(after).forEach { (b, a) ->
+            assertThat(a.value).isEqualTo(b.value)
+        }
     }
 }

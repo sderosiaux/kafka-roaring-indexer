@@ -9,8 +9,12 @@ import io.conduktor.kri.config.IndexerConfig
 import io.conduktor.kri.config.Member
 import io.conduktor.kri.config.Metric
 import io.conduktor.kri.config.Storage
+import io.conduktor.kri.index.BitSlicedIndex
 import io.conduktor.kri.index.DictEncoder
+import io.conduktor.kri.index.JointProfileIndex
+import io.conduktor.kri.index.MemberPermutation
 import io.conduktor.kri.index.Segment
+import io.conduktor.kri.index.ThetaSampleIndex
 import org.roaringbitmap.RoaringBitmap
 import org.slf4j.LoggerFactory
 import java.io.DataInputStream
@@ -56,11 +60,13 @@ class SegmentIO(
         Files.createDirectories(tmp.resolve("dims"))
         Files.createDirectories(tmp.resolve("dicts"))
         Files.createDirectories(tmp.resolve("metrics"))
+        Files.createDirectories(tmp.resolve("models"))
 
         writeMeta(seg, tmp.resolve("meta.json"))
         writeDims(seg, tmp.resolve("dims"))
         writeDicts(seg, tmp.resolve("dicts"))
         writeMetrics(seg, tmp.resolve("metrics"))
+        writeExperimentalModels(seg, tmp.resolve("models"))
 
         fsyncTree(tmp)
         if (Files.exists(dir)) deleteRecursively(dir)
@@ -190,6 +196,32 @@ class SegmentIO(
                 writeDict(dir.resolve("_member.dict"), md.entries().asSequence())
             }
         }
+    }
+
+    private fun writeExperimentalModels(
+        seg: Segment,
+        dir: Path,
+    ) {
+        // BSI per opted-in dim → models/{dim}.bsi
+        seg.bsi.forEach { (dim, idx) ->
+            DataOutputStream(openOutputStream(dir.resolve("$dim.bsi"))).use { out -> idx.serialize(out) }
+        }
+        // Theta sample → models/theta.sample (single per-segment file)
+        seg.theta?.let { th ->
+            DataOutputStream(openOutputStream(dir.resolve("theta.sample"))).use { out -> th.serialize(out) }
+        }
+        // Joint-profile → models/joint.profile
+        seg.jointProfile?.let { jp ->
+            DataOutputStream(openOutputStream(dir.resolve("joint.profile"))).use { out -> jp.serialize(out) }
+        }
+        // Member permutation → models/member.perm
+        seg.memberPermutation?.let { perm ->
+            DataOutputStream(openOutputStream(dir.resolve("member.perm"))).use { out ->
+                MemberPermutation.serialize(perm, out)
+            }
+        }
+        // Reordered dims are derived from canonical dims + permutation; no need to persist.
+        // (Recomputed at load time when permutation is present.)
     }
 
     private fun writeMetrics(
@@ -340,8 +372,52 @@ class SegmentIO(
             seg.offsets[p] = first..last
         }
 
+        // Experimental models: load from models/ directory if present.
+        // freeze() will rebuild reorderedDims from the loaded permutation, so we attach
+        // permutation BEFORE freeze() to short-circuit the freeze-time recomputation.
+        loadExperimentalModels(seg, dir.resolve("models"))
+
         seg.freeze()
         return seg
+    }
+
+    private fun loadExperimentalModels(
+        seg: Segment,
+        dir: Path,
+    ) {
+        if (!Files.exists(dir)) return
+        cfg.experimentalModels.bsiDims.forEach { dim ->
+            val f = dir.resolve("$dim.bsi")
+            if (Files.exists(f)) {
+                DataInputStream(openInputStream(f)).use { inp ->
+                    seg.attachBsi(dim, BitSlicedIndex.deserialize(inp))
+                }
+            }
+        }
+        if (cfg.experimentalModels.thetaSample) {
+            val f = dir.resolve("theta.sample")
+            if (Files.exists(f)) {
+                DataInputStream(openInputStream(f)).use { inp ->
+                    seg.attachTheta(ThetaSampleIndex.deserialize(inp))
+                }
+            }
+        }
+        if (cfg.experimentalModels.jointProfile) {
+            val f = dir.resolve("joint.profile")
+            if (Files.exists(f)) {
+                DataInputStream(openInputStream(f)).use { inp ->
+                    seg.attachJointProfile(JointProfileIndex.deserialize(inp))
+                }
+            }
+        }
+        if (cfg.experimentalModels.reorderMembers) {
+            val f = dir.resolve("member.perm")
+            if (Files.exists(f)) {
+                DataInputStream(openInputStream(f)).use { inp ->
+                    seg.attachMemberPermutation(MemberPermutation.deserialize(inp))
+                }
+            }
+        }
     }
 
     private fun fsyncTree(dir: Path) {

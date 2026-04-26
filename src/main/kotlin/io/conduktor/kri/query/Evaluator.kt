@@ -3,6 +3,7 @@ package io.conduktor.kri.query
 import com.dynatrace.hash4j.distinctcount.UltraLogLog
 import io.conduktor.kri.config.IndexerConfig
 import io.conduktor.kri.config.Metric
+import io.conduktor.kri.index.BitSlicedIndex
 import io.conduktor.kri.index.DictEncoder
 import io.conduktor.kri.index.RawUInt32Encoder
 import io.conduktor.kri.index.Segment
@@ -163,32 +164,72 @@ class Evaluator(
     }
 
     /**
-     * Reduces the filter to a RoaringBitmap within one segment.
-     * Uses [Segment.dimValueBitmap] / [Segment.memberUniverse] which snapshot (clone) bitmaps
-     * on open segments under the segment read-lock; frozen segments return bitmaps directly.
-     * Result is a fresh bitmap owned by the caller — safe to hand to FastAggregation.or.
+     * Reduces the filter to a RoaringBitmap within one segment, in CANONICAL memberId space.
+     *
+     * Uses reorderedDims + BSI when available (transparent perf optimization). The result is
+     * always translated back to canonical so cross-segment merges (FastAggregation.or) and
+     * facets (which AND against canonical seg.dims) remain correct.
+     *
+     * Use [evalFilterCanonical] for a baseline that ignores reordered/BSI (used by the
+     * multi-model comparison endpoint).
      */
     fun evalFilter(
         seg: Segment,
         ast: FilterAst,
+    ): RoaringBitmap {
+        val reordered = seg.reorderedDims
+        val perm = seg.memberPermutation
+        return if (reordered != null && perm != null) {
+            val raw =
+                evalFilterOn(
+                    seg,
+                    ast,
+                    reordered,
+                    seg.reorderedMemberUniverse() ?: RoaringBitmap(),
+                    useReorderedSpace = true,
+                    bsiAllowed = true,
+                )
+            perm.translateBack(raw)
+        } else {
+            evalFilterOn(seg, ast, seg.dims, seg.memberUniverse(), useReorderedSpace = false, bsiAllowed = true)
+        }
+    }
+
+    /**
+     * Pure baseline — ignores reorderedDims AND bsi. Always reads from seg.dims with the
+     * legacy linear-scan range eval. Kept so the multi-model bench can compare against an
+     * unoptimized Roaring channel.
+     */
+    fun evalFilterCanonical(
+        seg: Segment,
+        ast: FilterAst,
+    ): RoaringBitmap = evalFilterOn(seg, ast, seg.dims, seg.memberUniverse(), useReorderedSpace = false, bsiAllowed = false)
+
+    /** Internal eval driver. `source` is either canonical seg.dims or seg.reorderedDims. */
+    private fun evalFilterOn(
+        seg: Segment,
+        ast: FilterAst,
+        source: Map<String, Map<Int, RoaringBitmap>>,
+        universe: RoaringBitmap,
+        useReorderedSpace: Boolean,
+        bsiAllowed: Boolean,
     ): RoaringBitmap =
         when (ast) {
-            FilterAst.True -> seg.memberUniverse()
-            is FilterAst.Predicate -> predicateToBitmap(seg, ast)
-            is FilterAst.Range -> rangeToBitmap(seg, ast)
+            FilterAst.True -> universe
+            is FilterAst.Predicate -> predicateOn(seg, ast, source)
+            is FilterAst.Range -> rangeOn(seg, ast, source, useReorderedSpace, bsiAllowed)
             is FilterAst.And -> {
-                val a = evalFilter(seg, ast.left)
-                val b = evalFilter(seg, ast.right)
+                val a = evalFilterOn(seg, ast.left, source, universe, useReorderedSpace, bsiAllowed)
+                val b = evalFilterOn(seg, ast.right, source, universe, useReorderedSpace, bsiAllowed)
                 RoaringBitmap.and(a, b)
             }
             is FilterAst.Or -> {
-                val a = evalFilter(seg, ast.left)
-                val b = evalFilter(seg, ast.right)
+                val a = evalFilterOn(seg, ast.left, source, universe, useReorderedSpace, bsiAllowed)
+                val b = evalFilterOn(seg, ast.right, source, universe, useReorderedSpace, bsiAllowed)
                 RoaringBitmap.or(a, b)
             }
             is FilterAst.Not -> {
-                val universe = seg.memberUniverse()
-                val inner = evalFilter(seg, ast.inner)
+                val inner = evalFilterOn(seg, ast.inner, source, universe, useReorderedSpace, bsiAllowed)
                 RoaringBitmap.andNot(universe, inner)
             }
         }
@@ -197,18 +238,32 @@ class Evaluator(
         if (poolLazy.isInitialized()) pool.shutdown()
     }
 
-    private fun rangeToBitmap(
+    /**
+     * Range eval. Dispatches to BSI when allowed AND seg.bsi[dim] is built; otherwise scans
+     * the value map. BSI is keyed in canonical memberId space — when source is reordered,
+     * translate forward.
+     */
+    private fun rangeOn(
         seg: Segment,
         r: FilterAst.Range,
+        source: Map<String, Map<Int, RoaringBitmap>>,
+        useReorderedSpace: Boolean,
+        bsiAllowed: Boolean,
     ): RoaringBitmap {
+        if (bsiAllowed) {
+            seg.bsi[r.dim]?.let { bsi ->
+                val canonical = rangeViaBsi(bsi, r)
+                return if (useReorderedSpace) seg.memberPermutation!!.translateForward(canonical) else canonical
+            }
+        }
         val enc = seg.dimEncoder(r.dim) ?: return RoaringBitmap()
         if (enc !is RawUInt32Encoder) {
             log.warn("range filter on non-uint32 dim '{}' — returning empty", r.dim)
             return RoaringBitmap()
         }
-        val valueMap = seg.dims[r.dim] ?: return RoaringBitmap()
+        val valueMap = source[r.dim] ?: return RoaringBitmap()
         val acc = RoaringBitmap()
-        for ((rawId, _) in valueMap) {
+        for ((rawId, bm) in valueMap) {
             val v = rawId.toLong() and 0xFFFF_FFFFL
             val inRange =
                 when {
@@ -219,22 +274,39 @@ class Evaluator(
                     r.hi != null -> if (r.hiInclusive) v <= r.hi else v < r.hi
                     else -> false
                 }
-            if (inRange) {
-                val bm = seg.dimValueBitmap(r.dim, rawId) ?: continue
-                acc.or(bm)
-            }
+            if (inRange) acc.or(bm)
         }
         return acc
     }
 
-    private fun predicateToBitmap(
+    /** O'Neil BSI compare wrapper — maps a Range AST onto BSI primitives. */
+    private fun rangeViaBsi(
+        bsi: BitSlicedIndex,
+        r: FilterAst.Range,
+    ): RoaringBitmap {
+        val lo = r.lo
+        val hi = r.hi
+        return when {
+            lo != null && hi != null -> {
+                val loB = if (r.loInclusive) bsi.ge(lo) else bsi.gt(lo)
+                val hiB = if (r.hiInclusive) bsi.le(hi) else bsi.lt(hi)
+                RoaringBitmap.and(loB, hiB)
+            }
+            lo != null -> if (r.loInclusive) bsi.ge(lo) else bsi.gt(lo)
+            hi != null -> if (r.hiInclusive) bsi.le(hi) else bsi.lt(hi)
+            else -> RoaringBitmap()
+        }
+    }
+
+    private fun predicateOn(
         seg: Segment,
         p: FilterAst.Predicate,
+        source: Map<String, Map<Int, RoaringBitmap>>,
     ): RoaringBitmap {
         val enc = seg.dimEncoder(p.dim) ?: return RoaringBitmap()
         val ids = p.values.mapNotNull { v -> encodeValue(enc, v) }
         if (ids.isEmpty()) return RoaringBitmap()
-        val parts = ids.mapNotNull { id -> seg.dimValueBitmap(p.dim, id) }
+        val parts = ids.mapNotNull { id -> source[p.dim]?.get(id)?.clone() }
         if (parts.isEmpty()) return RoaringBitmap()
         val acc = RoaringBitmap()
         parts.forEach { acc.or(it) }

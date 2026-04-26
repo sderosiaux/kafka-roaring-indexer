@@ -2,6 +2,7 @@ package io.conduktor.kri.index
 
 import com.dynatrace.hash4j.distinctcount.UltraLogLog
 import io.conduktor.kri.config.Dimension
+import io.conduktor.kri.config.ExperimentalModels
 import io.conduktor.kri.config.IndexerConfig
 import io.conduktor.kri.config.Metric
 import org.roaringbitmap.RoaringBitmap
@@ -25,6 +26,7 @@ class Segment(
     private val dimEncoders: Map<String, DimEncoder>,
     private val memberFieldName: String,
     private val metricFields: Map<String, String?>,
+    private val experimental: ExperimentalModels = ExperimentalModels(),
 ) {
     private val lock = ReentrantReadWriteLock()
 
@@ -45,6 +47,30 @@ class Segment(
     val offsets: MutableMap<Int, LongRange> = ConcurrentHashMap()
     val recordCount = AtomicLong(0)
 
+    // ── Parallel index models (opt-in via ExperimentalModels). Coexist with dims/ullSketches.
+
+    /** dimName → BitSlicedIndex over the raw uint32 numeric value. Built online during add(). */
+    val bsi: MutableMap<String, BitSlicedIndex> = ConcurrentHashMap()
+
+    /** Per-segment theta sample of memberIds + parallel dim bitmaps over the sampled subset. */
+    @Volatile var theta: ThetaSampleIndex? = null
+        private set
+
+    /** Built at freeze when [ExperimentalModels.jointProfile] is on. */
+    @Volatile var jointProfile: JointProfileIndex? = null
+        private set
+
+    /** Built at freeze when [ExperimentalModels.reorderMembers] is on. */
+    @Volatile var memberPermutation: MemberPermutation? = null
+        private set
+
+    /** Built at freeze when [ExperimentalModels.reorderMembers] is on. Same shape as [dims]. */
+    @Volatile var reorderedDims: MutableMap<String, MutableMap<Int, RoaringBitmap>>? = null
+        private set
+
+    /** OR of all reordered dim bitmaps. Computed lazily and cached. Null if no reordering. */
+    @Volatile private var reorderedUniverseCache: RoaringBitmap? = null
+
     init {
         dimSpecs.forEach { dims[it.name] = ConcurrentHashMap() }
         metricSpecs.forEach { m ->
@@ -55,7 +81,20 @@ class Segment(
                 else -> { /* hll/cpc: omitted in v1 */ }
             }
         }
+        // Parallel models — only initialize state for what's enabled.
+        experimental.bsiDims.forEach { name ->
+            if (dimSpecs.any { it.name == name }) bsi[name] = BitSlicedIndex(bitWidth = 32)
+        }
+        if (experimental.thetaSample) {
+            theta = ThetaSampleIndex(theta = ThetaSampleIndex.thetaFor(experimental.thetaSampleRate))
+        }
     }
+
+    fun experimentalConfig(): ExperimentalModels = experimental
+
+    fun dimSpecs(): List<Dimension> = dimSpecs
+
+    fun fieldFor(dimName: String): String? = dimSpecs.firstOrNull { it.name == dimName }?.field
 
     fun add(
         partition: Int,
@@ -68,6 +107,9 @@ class Segment(
         val memberId = memberEncoder.encode(memberRaw) ?: return AddResult.MemberMissing
 
         val overflows = mutableListOf<String>()
+
+        // Track atoms that hit the canonical path so we can mirror them into the theta sample.
+        val acceptedAtoms = if (theta != null) ArrayList<Pair<String, Int>>(dimSpecs.size) else null
 
         lock.read {
             dimSpecs.forEach { d ->
@@ -83,9 +125,18 @@ class Segment(
                         val valueMap = dims.getValue(d.name)
                         val bm = synchronized(valueMap) { valueMap.getOrPut(r.id) { RoaringBitmap() } }
                         synchronized(bm) { bm.add(memberId) }
+                        acceptedAtoms?.add(d.name to r.id)
                     }
                     EncodeResult.Overflow -> overflows.add(d.name)
                     EncodeResult.Skip -> { /* silently skip this dim */ }
+                }
+
+                // Parallel BSI path: bypasses bucketing — indexes the raw uint32 numeric value.
+                bsi[d.name]?.let { bsiIdx ->
+                    val numeric = (rawValue as? Number)?.toLong() ?: (rawValue as? String)?.toLongOrNull()
+                    if (numeric != null && numeric in 0..0xFFFF_FFFFL) {
+                        synchronized(bsiIdx) { bsiIdx.set(memberId, numeric) }
+                    }
                 }
             }
 
@@ -122,6 +173,10 @@ class Segment(
             }
         }
 
+        // Mirror this record into the theta sample iff hash(memberId) < theta.
+        // Done outside the dim loop so all atoms are known + threshold check happens once.
+        theta?.let { th -> acceptedAtoms?.let { atoms -> th.maybeAdd(memberId, atoms) } }
+
         recordCount.incrementAndGet()
         offsets.compute(partition) { _, prev ->
             if (prev == null) offset..offset else minOf(prev.first, offset)..maxOf(prev.last, offset)
@@ -137,6 +192,20 @@ class Segment(
             val universe = RoaringBitmap()
             dims.values.forEach { vm -> vm.values.forEach { universe.or(it) } }
             frozenUniverse = universe
+
+            // Parallel models: optimize then build derived structures.
+            // Skip rebuild if state was already attached (e.g. by SegmentIO.read).
+            bsi.values.forEach { it.runOptimize() }
+            theta?.runOptimize()
+            if (experimental.reorderMembers && memberPermutation == null) {
+                val perm = MemberPermutation.build(this)
+                memberPermutation = perm
+                reorderedDims = ReorderedRoaring.build(this, perm)
+            }
+            if (experimental.jointProfile && jointProfile == null) {
+                jointProfile = JointProfileIndex.build(this)
+            }
+
             frozen = true
         }
     }
@@ -177,6 +246,56 @@ class Segment(
     fun dimEncoder(dim: String): DimEncoder? = dimEncoders[dim]
 
     fun memberEncoder(): MemberEncoder = memberEncoder
+
+    /**
+     * Reordered counterpart of [dimValueBitmap]. Returns the bitmap in REORDERED-id space.
+     * Caller is expected to translate back to canonical via [memberPermutation] if downstream
+     * code expects canonical ids.
+     */
+    fun reorderedDimValueBitmap(
+        dim: String,
+        value: Int,
+    ): RoaringBitmap? = reorderedDims?.get(dim)?.get(value)
+
+    /**
+     * OR of every reordered dim bitmap, cached. Returns null when no reordering exists.
+     */
+    fun reorderedMemberUniverse(): RoaringBitmap? {
+        val rd = reorderedDims ?: return null
+        reorderedUniverseCache?.let { return it }
+        val all = RoaringBitmap()
+        rd.values.forEach { vm -> vm.values.forEach { all.or(it) } }
+        all.runOptimize()
+        reorderedUniverseCache = all
+        return all
+    }
+
+    /** IO layer hook: install a deserialized BSI for [dim]. Replaces any existing one. */
+    fun attachBsi(
+        dim: String,
+        idx: BitSlicedIndex,
+    ) {
+        bsi[dim] = idx
+    }
+
+    /** IO layer hook: install a deserialized theta sample. */
+    fun attachTheta(idx: ThetaSampleIndex) {
+        theta = idx
+    }
+
+    /** IO layer hook: install a deserialized joint-profile index. */
+    fun attachJointProfile(jp: JointProfileIndex) {
+        jointProfile = jp
+    }
+
+    /**
+     * IO layer hook: install a deserialized permutation and rebuild reordered dims from it.
+     * Must be called AFTER canonical dims have been loaded.
+     */
+    fun attachMemberPermutation(perm: MemberPermutation) {
+        memberPermutation = perm
+        reorderedDims = ReorderedRoaring.build(this, perm)
+    }
 
     sealed interface AddResult {
         data object Ok : AddResult
@@ -227,6 +346,7 @@ class Segment(
                 dimEncoders = dimEncoders,
                 memberFieldName = cfg.member.field,
                 metricFields = metricFields,
+                experimental = cfg.experimentalModels,
             )
         }
     }

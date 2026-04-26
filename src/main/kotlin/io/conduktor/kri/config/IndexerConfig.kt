@@ -18,6 +18,31 @@ data class IndexerConfig(
     val storage: Storage,
     val query: Query = Query(),
     val observability: Observability = Observability(),
+    val experimentalModels: ExperimentalModels = ExperimentalModels(),
+)
+
+/**
+ * Opt-in alternative index models, built in parallel to the canonical Roaring + ULL path.
+ *
+ * Existing Roaring/ULL state is never replaced — these models add structures that the query
+ * layer can target via the `models=` HTTP parameter for side-by-side comparison.
+ */
+@Serializable
+data class ExperimentalModels(
+    /** Numeric dim names that get a Bit-Sliced Index in addition to the bucketed Roaring. */
+    val bsiDims: List<String> = emptyList(),
+    /** When true, build a per-segment theta sample of memberIds for distinct-under-filter. */
+    val thetaSample: Boolean = false,
+    /** Fraction of memberIds kept by the theta sample. 1.0 = all. Default 1/16 ≈ 6.25%. */
+    val thetaSampleRate: Double = 0.0625,
+    /** When true, build a joint-profile dictionary at freeze. */
+    val jointProfile: Boolean = false,
+    /**
+     * When true, compute a member-axis permutation at freeze and build reordered Roaring.
+     * Default ON: ~25-40% smaller dim bitmaps + faster AND/OR on tightly-clustered users, at
+     * the cost of one extra freeze pass. Evaluator auto-uses reordered when present.
+     */
+    val reorderMembers: Boolean = true,
 )
 
 @Serializable

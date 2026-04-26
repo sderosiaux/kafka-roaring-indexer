@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import io.conduktor.kri.config.IndexerConfig
 import io.conduktor.kri.config.Metric
 import io.conduktor.kri.index.DictEncoder
+import io.conduktor.kri.index.IndexModelKind
 import io.conduktor.kri.index.RawUInt32Encoder
 import io.conduktor.kri.index.SegmentStore
 import io.javalin.Javalin
@@ -34,6 +35,7 @@ class HttpServer(
     private val log = LoggerFactory.getLogger(javaClass)
     private lateinit var app: Javalin
     private val mapper = ObjectMapper()
+    private val multiEval = MultiModelEvaluator(cfg, evaluator)
 
     private val httpClient: HttpClient =
         HttpClient
@@ -157,7 +159,37 @@ class HttpServer(
                 ctx.status(400).json(mapOf("error" to "too many segments: ${segs.size} > ${cfg.query.maxSegmentsPerQuery}"))
                 return
             }
-            val resp = evaluator.evaluate(segs, QueryRequest(from, to, filter, agg))
+            val req = QueryRequest(from, to, filter, agg)
+
+            // Multi-model comparison: opt-in via &models=roaring,bsi,theta,joint_profile,roaring_reordered.
+            val rawModels = ctx.queryParam("models")
+            if (!rawModels.isNullOrBlank()) {
+                val models = IndexModelKind.parseList(rawModels)
+                val results = multiEval.evaluate(segs, req, models)
+                ctx.json(
+                    mapOf(
+                        "segments" to segs.size,
+                        "metric" to agg,
+                        "results" to
+                            results.map { r ->
+                                val m =
+                                    mutableMapOf<String, Any?>(
+                                        "model" to r.model.name.lowercase(),
+                                        "supported" to r.supported,
+                                        "value" to r.value,
+                                        "approx" to r.approx,
+                                        "timeNs" to r.timeNs,
+                                        "timeMs" to r.timeNs / 1_000_000.0,
+                                    )
+                                if (r.error != null) m["error"] = r.error
+                                m
+                            },
+                    ),
+                )
+                return
+            }
+
+            val resp = evaluator.evaluate(segs, req)
             ctx.json(
                 mapOf(
                     "segments" to resp.segmentCount,
